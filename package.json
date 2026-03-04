@@ -1,0 +1,31 @@
+{
+  "name": "servus",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.55",
+    "@ai-sdk/google": "^3.0.37",
+    "@ai-sdk/openai": "^3.0.39",
+    "ai": "^6.0.111",
+    "boxen": "^5.1.2",
+    "chalk": "^4.1.2",
+    "cli-spinners": "^3.4.0",
+    "commander": "^14.0.3",
+    "dotenv": "^17.3.1",
+    "enquirer": "^2.4.1",
+    "ora": "^5.4.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

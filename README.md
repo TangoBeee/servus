@@ -1,0 +1,25 @@
+# Servus
+
+Servus is an autonomous CLI-based AI coding agent built for deep, long-term task execution and continuous engineering context.
+
+## Features
+- **ReAct Loop Agent**: Powered by Vercel AI SDK to Observe, Think, and Act.
+- **Persistent Memory**: Retains conversation sequences and continuous context across reboots (`.servus/`).
+- **Sub-Agent Delegation**: Smartly delegates independent complexity off to nested sub-agents when required.
+- **Infinite Watcher Loop**: Runs via `--watch` to constantly monitor your workspace and autonomously resolve user intent upon file saves.
+- **Asynchronous Injection**: Type `i` (Interrupt) at any time to stream real-time directional intent into the LLM context flow.
+- **E2E Task Validation**: Written to strictly verify the output of its own generated scripts using the terminal, effectively writing and self-healing its code.
+
+## Quickstart
+1. Clone the repository and install dependencies:
+```bash
+npm install
+```
+2. Build the TypeScript source:
+```bash
+npm run build
+```
+3. Run the CLI and pass it a task:
+```bash
+npx ts-node src/index.ts "Build me a simple express server"
+```
