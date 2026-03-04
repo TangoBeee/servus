@@ -3,6 +3,7 @@
 Servus is an autonomous CLI-based AI coding agent built for deep, long-term task execution and continuous engineering context.
 
 ## Features
+- **Multi-Provider LLM**: Supports OpenAI (`gpt-*`), Anthropic Claude (`claude-*`), and Google Gemini (`gemini-*`) models out of the box.
 - **ReAct Loop Agent**: Powered by Vercel AI SDK to Observe, Think, and Act.
 - **Persistent Memory**: Retains conversation sequences and continuous context across reboots (`.servus/`).
 - **Sub-Agent Delegation**: Smartly delegates independent complexity off to nested sub-agents when required.

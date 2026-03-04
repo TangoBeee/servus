@@ -1,5 +1,7 @@
 import { generateText } from 'ai';
 import { openai } from '@ai-sdk/openai';
+import { anthropic } from '@ai-sdk/anthropic';
+import { google } from '@ai-sdk/google';
 
 export const SYSTEM_PROMPT = `
 You are Servus, an autonomous CLI-based AI coding agent and Senior Software Engineer.
@@ -13,9 +15,15 @@ CRITICAL Directives:
 5. E2E VERIFICATION: Before calling a task complete, you MUST verify that the code you wrote actually works. Use \`execute_terminal_command\` to build, compile, or run the application (e.g., run tests, run node scripts). If the verification fails, you MUST autonomously read the error, fix the code, and re-verify until it works. Every completed task MUST be verified locally.
 `;
 
-export async function askLLM(prompt: string, system: string = SYSTEM_PROMPT) {
+function getModel(modelName: string) {
+    if (modelName.startsWith('claude')) return anthropic(modelName);
+    if (modelName.startsWith('gemini')) return google(modelName);
+    return openai(modelName);
+}
+
+export async function askLLM(prompt: string, system: string = SYSTEM_PROMPT, modelName: string = 'gpt-4.1-nano') {
     const { text } = await generateText({
-        model: openai('gpt-4.1-nano'),
+        model: getModel(modelName),
         system,
         prompt,
     });
