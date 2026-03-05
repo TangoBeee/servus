@@ -44,7 +44,7 @@ function App() {
   const [copied, setCopied] = useState(false)
 
   const handleCopy = () => {
-    navigator.clipboard.writeText('npm install && npx ts-node src/index.ts "your task"')
+    navigator.clipboard.writeText('npm install servusai -g && servusai "your task"')
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }
@@ -180,7 +180,7 @@ function App() {
         </div>
         <div className="install-box">
           <span className="dollar">$</span>
-          <code>npm install && npx ts-node src/index.ts "your task"</code>
+          <code>npm install servusai -g && servusai "your task"</code>
           <button onClick={handleCopy}>{copied ? '✓' : 'Copy'}</button>
         </div>
       </section>

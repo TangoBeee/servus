@@ -22,5 +22,5 @@ npm run build
 ```
 3. Run the CLI and pass it a task:
 ```bash
-npx ts-node src/index.ts "Build me a simple express server"
+npm install servusai -g && servusai "Build me a simple express server
 ```
