@@ -1,6 +1,6 @@
 {
   "name": "servusai",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Servus — An autonomous CLI-based AI coding agent that reads your codebase, writes code, runs tests, and self-heals.",
   "main": "dist/index.js",
   "bin": {
