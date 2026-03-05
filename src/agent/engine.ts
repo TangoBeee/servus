@@ -217,17 +217,43 @@ export class AgentEngine {
                         this.saveMemory();
                     }
                 } else {
-                    // No tool calls means task is likely complete or stuck
-                    finalResultText = result.text;
+                    // No tool calls — the agent said something in text.
+                    // Prompt the user for follow-up instead of exiting immediately.
                     console.log(
-                        boxen(chalk.green.bold(`${this.prefix}TASK COMPLETE / NO MORE ACTIONS:\n\n`) + chalk.white(result.text), {
+                        boxen(chalk.white(result.text), {
                             padding: 1,
                             margin: 1,
                             borderStyle: 'bold',
                             borderColor: 'green'
                         })
                     );
-                    break;
+
+                    // Pause raw mode so enquirer can read input normally
+                    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+                    process.stdin.off('keypress', handleKeypress);
+
+                    const Enquirer = (await import('enquirer')).default;
+                    const followUp: any = await Enquirer.prompt({
+                        type: 'input',
+                        name: 'reply',
+                        message: chalk.cyan.bold('Your reply (Enter to finish)')
+                    });
+
+                    // Restore raw mode
+                    if (process.stdin.isTTY) {
+                        process.stdin.setRawMode(true);
+                        process.stdin.resume();
+                        process.stdin.on('keypress', handleKeypress);
+                    }
+
+                    if (!followUp.reply || !followUp.reply.trim()) {
+                        finalResultText = result.text;
+                        break; // User pressed Enter with no input — exit
+                    }
+
+                    // Inject user's reply and continue the loop
+                    this.messages.push({ role: 'user', content: followUp.reply.trim() });
+                    this.saveMemory();
                 }
 
             } catch (error: any) {
