@@ -68,15 +68,20 @@ export class ConfigManager {
     }
 
     async runInitialSetup() {
-        // If config has API keys, load them into env natively
-        if (this.config.apiKey) process.env.OPENAI_API_KEY = this.config.apiKey;
-        if (this.config.anthropicApiKey) process.env.ANTHROPIC_API_KEY = this.config.anthropicApiKey;
-        if (this.config.googleApiKey) process.env.GOOGLE_GENERATIVE_AI_API_KEY = this.config.googleApiKey;
+        // Keys come ONLY from ~/.servusrc — env vars are intentionally ignored.
+        // This ensures consistent behaviour whether running locally or globally via npm.
+        const storedKey = this.config.apiKey || this.config.anthropicApiKey || this.config.googleApiKey;
 
-        if (!this.isFirstRun) return;
+        if (!this.isFirstRun && storedKey) {
+            // Push stored key to env so SDK picks it up
+            if (this.config.apiKey) process.env.OPENAI_API_KEY = this.config.apiKey;
+            if (this.config.anthropicApiKey) process.env.ANTHROPIC_API_KEY = this.config.anthropicApiKey;
+            if (this.config.googleApiKey) process.env.GOOGLE_GENERATIVE_AI_API_KEY = this.config.googleApiKey;
+            return;
+        }
 
         const Enquirer = (await import('enquirer')).default;
-        console.log(chalk.green.bold('\n[+] Welcome to Servus! Initial setup required.\n'));
+        console.log(chalk.green.bold('\n[+] Welcome to Servus! Let\'s get you set up.\n'));
 
         const providerResp: any = await Enquirer.prompt({
             type: 'select',
@@ -85,22 +90,35 @@ export class ConfigManager {
             choices: ['OpenAI', 'Anthropic', 'Google']
         });
 
-        if (providerResp.provider === 'OpenAI' && !process.env.OPENAI_API_KEY) {
-            const apiResp: any = await Enquirer.prompt({ type: 'password', name: 'key', message: 'Enter your OpenAI API Key:' });
-            this.set('apiKey', apiResp.key);
-            process.env.OPENAI_API_KEY = apiResp.key;
-            console.log(chalk.gray(`Saved OpenAI key to ~/.servusrc\n`));
-        } else if (providerResp.provider === 'Anthropic' && !process.env.ANTHROPIC_API_KEY) {
-            const apiResp: any = await Enquirer.prompt({ type: 'password', name: 'key', message: 'Enter your Anthropic API Key:' });
-            this.set('anthropicApiKey', apiResp.key);
-            process.env.ANTHROPIC_API_KEY = apiResp.key;
-            console.log(chalk.gray(`Saved Anthropic key to ~/.servusrc\n`));
-        } else if (providerResp.provider === 'Google' && !process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
-            const apiResp: any = await Enquirer.prompt({ type: 'password', name: 'key', message: 'Enter your Google Gemini API Key:' });
-            this.set('googleApiKey', apiResp.key);
-            process.env.GOOGLE_GENERATIVE_AI_API_KEY = apiResp.key;
-            console.log(chalk.gray(`Saved Google key to ~/.servusrc\n`));
+        const keyMessages: Record<string, string> = {
+            'OpenAI': 'Enter your OpenAI API Key:',
+            'Anthropic': 'Enter your Anthropic API Key:',
+            'Google': 'Enter your Google Gemini API Key:'
+        };
+
+        const apiResp: any = await Enquirer.prompt({
+            type: 'password',
+            name: 'key',
+            message: keyMessages[providerResp.provider]
+        });
+
+        if (!apiResp.key || !apiResp.key.trim()) {
+            console.log(chalk.red('[!] No API key entered. Exiting.'));
+            process.exit(1);
         }
+
+        // Store key in ~/.servusrc and inject into env for this session
+        if (providerResp.provider === 'OpenAI') {
+            this.set('apiKey', apiResp.key.trim());
+            process.env.OPENAI_API_KEY = apiResp.key.trim();
+        } else if (providerResp.provider === 'Anthropic') {
+            this.set('anthropicApiKey', apiResp.key.trim());
+            process.env.ANTHROPIC_API_KEY = apiResp.key.trim();
+        } else if (providerResp.provider === 'Google') {
+            this.set('googleApiKey', apiResp.key.trim());
+            process.env.GOOGLE_GENERATIVE_AI_API_KEY = apiResp.key.trim();
+        }
+        console.log(chalk.gray(`[+] API key saved to ~/.servusrc\n`));
 
         const defaultModels: Record<string, string> = {
             'OpenAI': 'gpt-4o',
@@ -112,7 +130,7 @@ export class ConfigManager {
             {
                 type: 'input',
                 name: 'model',
-                message: `Default ${providerResp.provider} Model to use?`,
+                message: `Default ${providerResp.provider} model to use?`,
                 initial: defaultModels[providerResp.provider]
             },
             {
@@ -126,6 +144,6 @@ export class ConfigManager {
         this.set('defaultModel', configResp.model);
         this.set('workspace', configResp.workspace);
         this.isFirstRun = false;
-        console.log(chalk.green.bold('\n[+] Setup complete!\n'));
+        console.log(chalk.green.bold('\n[+] Setup complete! You\'re good to go.\n'));
     }
 }
