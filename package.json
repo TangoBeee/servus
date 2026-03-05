@@ -1,14 +1,36 @@
 {
-  "name": "servus",
+  "name": "servusai",
   "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "description": "Servus — An autonomous CLI-based AI coding agent that reads your codebase, writes code, runs tests, and self-heals.",
+  "main": "dist/index.js",
+  "bin": {
+    "servusai": "./dist/index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "files": [
+    "dist/**/*"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "coding-agent",
+    "openai",
+    "anthropic",
+    "gemini",
+    "autonomous"
+  ],
+  "author": "TangoBeee",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TangoBeee/servus.git"
+  },
+  "homepage": "https://tangobee.github.io/servus",
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.55",
     "@ai-sdk/google": "^3.0.37",
