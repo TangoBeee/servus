@@ -291,6 +291,7 @@ export class AgentEngine {
             process.stdin.setRawMode(false);
             process.stdin.off('keypress', handleKeypress);
         }
+        process.stdin.pause();
 
         return finalResultText;
     }
