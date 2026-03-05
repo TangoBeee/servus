@@ -20,8 +20,12 @@ jobs:
 
       - run: npm ci
 
-      - name: Bump patch version
-        run: npm version patch --no-git-tag-version
+      - name: Bump beyond latest published version
+        run: |
+          LATEST=$(npm view servusai version 2>/dev/null || echo "0.0.0")
+          echo "Latest on npm: $LATEST"
+          npm version "$LATEST" --no-git-tag-version --allow-same-version
+          npm version patch --no-git-tag-version
 
       - run: npm run build
 
