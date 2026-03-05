@@ -12,15 +12,18 @@ Servus is an autonomous CLI-based AI coding agent built for deep, long-term task
 - **E2E Task Validation**: Written to strictly verify the output of its own generated scripts using the terminal, effectively writing and self-healing its code.
 
 ## Quickstart
-1. Clone the repository and install dependencies:
+
+### Install globally from npm
 ```bash
+npm install -g servusai
+servusai "Build me a simple express server"
+```
+
+### Or run from source
+```bash
+git clone https://github.com/TangoBeee/servus.git
+cd servus
 npm install
-```
-2. Build the TypeScript source:
-```bash
 npm run build
-```
-3. Run the CLI and pass it a task:
-```bash
-npm install servusai -g && servusai "Build me a simple express server
+node dist/index.js "Build me a simple express server"
 ```
