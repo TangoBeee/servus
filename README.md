@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="frontend/public/logo.svg" alt="/ S /" width="96" />
+  <img src="frontend/public/servus.png" alt="/ S /" width="96" />
 </p>
 
 <h1 align="center">Servus</h1>
