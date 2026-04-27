@@ -1,0 +1,65 @@
+{
+  "name": "servusai",
+  "version": "0.1.0-beta.0",
+  "author": "tangobee",
+  "description": "Local-first multi-capability AI operator with proof-backed execution",
+  "type": "module",
+  "bin": {
+    "servus": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "dev": "tsx --watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TangoBeee/servus"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.64",
+    "@ai-sdk/google": "^3.0.53",
+    "@ai-sdk/openai": "^3.0.48",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.76",
+    "@anthropic-ai/sdk": "^0.80.0",
+    "@google/genai": "^1.46.0",
+    "@inkjs/ui": "^2.0.0",
+    "@playwright/test": "^1.58.2",
+    "ai": "^6.0.116",
+    "csv-parse": "^6.2.1",
+    "ink": "^6.0.0",
+    "ink-select-input": "^6.0.0",
+    "ink-spinner": "^5.0.0",
+    "ink-text-input": "^6.0.0",
+    "json-schema-to-zod": "^2.7.0",
+    "mammoth": "^1.12.0",
+    "node-xlsx": "^0.24.0",
+    "openai": "^6.33.0",
+    "pino": "^10.3.1",
+    "playwright": "^1.58.2",
+    "playwright-core": "^1.58.2",
+    "react": "^19.0.0",
+    "unpdf": "^1.6.0",
+    "uuid": "^13.0.0",
+    "zod": "^4.3.6",
+    "zod-to-json-schema": "^3.25.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/react": "^19.0.0",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
