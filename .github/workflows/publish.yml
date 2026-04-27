@@ -41,8 +41,6 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
       - run: npm publish --access public --tag beta
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create and push git tag
         run: |
