@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
+import toast, { Toaster } from 'react-hot-toast'
 import './index.css'
 
 const ASCII_GLOBE = `
@@ -532,6 +533,7 @@ function App() {
 
   return (
     <div className={`app-wrapper ${isHacked ? 'hacked-mode' : ''}`}>
+      <Toaster position="top-right" toastOptions={{ style: { fontSize: '0.875rem', borderRadius: '0.375rem' } }} />
       <div className="scanlines"></div>
       <div className="grid-bg"></div>
 
@@ -556,7 +558,11 @@ function App() {
           <a className="nav-item" href="#" onClick={(e) => { e.preventDefault(); triggerDocsTerminal(); }}><span className="nav-shortcut">[D]</span> DOCS</a>
           <a className="nav-item" href="#" onClick={(e) => { e.preventDefault(); setPricingOpen(true); }}><span className="nav-shortcut">[P]</span> PRICING</a>
         </div>
-        <div>
+        <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginLeft: 'auto' }}>
+          <button onClick={() => { navigator.clipboard.writeText('npm install -g servusai'); toast.success('Copied: npm install -g servusai', { duration: 2000 }); }} style={{ background: 'rgba(34, 197, 94, 0.15)', border: '1px solid rgba(34, 197, 94, 0.3)', color: '#22c55e', cursor: 'pointer', fontSize: '0.8rem', padding: '0.4rem 0.7rem', borderRadius: '0.375rem', transition: 'all 0.2s ease', display: 'flex', alignItems: 'center', gap: '0.4rem', fontFamily: 'var(--font-mono)', fontWeight: '500', whiteSpace: 'nowrap' }} onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(34, 197, 94, 0.25)'; e.currentTarget.style.borderColor = 'rgba(34, 197, 94, 0.6)'; e.currentTarget.style.boxShadow = '0 0 0.5rem rgba(34, 197, 94, 0.3)'; }} onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(34, 197, 94, 0.15)'; e.currentTarget.style.borderColor = 'rgba(34, 197, 94, 0.3)'; e.currentTarget.style.boxShadow = 'none'; }} title="Copy: npm install -g servusai">
+            <span style={{ fontSize: '0.8rem' }}>📦</span>
+            <code style={{ fontSize: '0.7rem', letterSpacing: '0.3px' }}>npm install -g servusai</code>
+          </button>
           <span className="nav-item" onClick={() => setConsoleOpen(!consoleOpen)} style={{ cursor: 'pointer' }}>
             <span className="nav-shortcut">[C]</span> CONSOLE
           </span>
@@ -569,8 +575,8 @@ function App() {
             <h1 className="hero-title" style={{ position: 'relative' }}>
               Welcome to Servus<span className="pixel-box">OS</span>
             </h1>
-            <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.85rem', color: isHacked ? '#f00' : 'var(--text-dim)', marginBottom: '1.5rem', background: isHacked ? 'rgba(255,0,0,0.1)' : 'rgba(255,255,255,0.05)', display: 'inline-block', padding: '0.2rem 0.5rem' }}>
-              {isHacked ? '[ SYSTEM COMPROMISED ]' : '[ IN ACTIVE DEVELOPMENT ]'}
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.85rem', color: isHacked ? '#f00' : 'var(--text-dim)', marginBottom: '1.5rem', background: isHacked ? 'rgba(255,0,0,0.1)' : 'rgba(255,255,255,0.05)', display: 'inline-flex', padding: '0.2rem 0.5rem', alignItems: 'center', gap: '0.5rem' }}>
+              {isHacked ? '[ SYSTEM COMPROMISED ]' : <>[ <div style={{ display: 'inline-block', width: '0.5rem', height: '0.5rem', background: '#22c55e', borderRadius: '50%', boxShadow: '0 0 0.5rem #22c55e, inset 0 0 0.5rem rgba(34,197,94,0.5)', animation: 'pulse 2s infinite', margin: '0 0.25rem' }} /> IN ACTIVE DEVELOPMENT ]</>}
             </div>
             <p className="hero-desc">
               Local-first AI operator for coding, browser workflows, desktop files, data/docs, media, security analysis, and custom skills/plugins — with proof-backed completion.
