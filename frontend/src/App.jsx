@@ -709,7 +709,7 @@ function App() {
           color: 'var(--text-dim)',
           fontSize: '0.85rem'
         }}>
-          Took inspiration from stripe.dev
+          It's all AI.
         </footer>
       </main>
 
