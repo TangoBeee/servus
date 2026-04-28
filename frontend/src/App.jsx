@@ -115,7 +115,7 @@ const playExplosionSound = (ctx) => {
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
 function Console({
-  onClose, history, setHistory, commandHistory, setCommandHistory, isRoot, setIsRoot, setIsHacked, setIsNuking
+  onClose, history, setHistory, commandHistory, setCommandHistory, isRoot, setIsRoot, setIsHacked, setIsNuking, audioRef, isPlaying, setIsPlaying, musicVolume, setMusicVolume
 }) {
   const [input, setInput] = useState('');
   const [historyIndex, setHistoryIndex] = useState(-1);
@@ -225,7 +225,7 @@ function Console({
 
     // Commands
     else if (command === 'help') {
-      setHistory(prev => [...prev, { type: 'system', content: 'Commands: help, about, start, clear, echo, date, whoami, ls, cat, pwd, ping, hack, contact' + (isRoot ? ', nuke' : '') }]);
+      setHistory(prev => [...prev, { type: 'system', content: 'Commands: help, about, start, clear, echo, date, whoami, ls, cat, pwd, ping, hack, contact, music play, music stop, music volume <0-100>' + (isRoot ? ', nuke' : '') }]);
     } else if (command === 'clear') {
       setHistory([]);
     } else if (command === 'about') {
@@ -295,6 +295,33 @@ function Console({
       setHistory(prev => [...prev, { type: 'system', content: '>>> SAFE SIMULATION ONLY. No real systems touched.\nUnlocking hidden website components...' }]);
     } else if (command === 'contact') {
       setHistory(prev => [...prev, { type: 'system', content: '>>> Opening communication channel...\nEmail: tangobeee@gmail.com\nWebsite: https://tangobee.dev/servus\nGitHub: github.com/TangoBeee\nFeel free to reach out for Pro plans or customizations!' }]);
+    } else if (command === 'music') {
+      const musicCmd = args[1];
+      if (musicCmd === 'play') {
+        if (audioRef.current) {
+          audioRef.current.play();
+          setIsPlaying(true);
+          setHistory(prev => [...prev, { type: 'system', content: '🎵 Now playing: Pixelland by Kevin MacLeod\nhttps://www.youtube.com/watch?v=rQqr10MC_uw' }]);
+        }
+      } else if (musicCmd === 'stop') {
+        if (audioRef.current) {
+          audioRef.current.pause();
+          audioRef.current.currentTime = 0;
+          setIsPlaying(false);
+          setHistory(prev => [...prev, { type: 'system', content: '⏹️ Music stopped.' }]);
+        }
+      } else if (musicCmd === 'volume') {
+        const vol = parseInt(args[2]);
+        if (!isNaN(vol) && vol >= 0 && vol <= 100) {
+          setMusicVolume(vol);
+          if (audioRef.current) audioRef.current.volume = vol / 100;
+          setHistory(prev => [...prev, { type: 'system', content: `🔊 Volume set to ${vol}%` }]);
+        } else {
+          setHistory(prev => [...prev, { type: 'system', content: 'Invalid volume. Use: music volume <0-100>' }]);
+        }
+      } else {
+        setHistory(prev => [...prev, { type: 'system', content: 'Music commands: play, stop, volume <0-100>' }]);
+      }
     } else if (command === 'nuke') {
       if (isRoot) {
         setHistory(prev => [...prev, { type: 'system', content: 'WARNING: TACTICAL NUKE INBOUND. DESTROYING UI...' }]);
@@ -439,6 +466,7 @@ const BASE_DIRECTORY_FEED = [
   }
 ];
 
+
 function App() {
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [pricingOpen, setPricingOpen] = useState(false);
@@ -448,6 +476,11 @@ function App() {
   const [isHacked, setIsHacked] = useState(false);
   const [isNuking, setIsNuking] = useState(false);
   const [nukeStage, setNukeStage] = useState(0);
+
+  // Music states
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [musicVolume, setMusicVolume] = useState(50);
+  const audioRef = useRef(null);
 
   // Lifted Terminal State
   const [history, setHistory] = useState([
@@ -534,6 +567,7 @@ function App() {
   return (
     <div className={`app-wrapper ${isHacked ? 'hacked-mode' : ''}`}>
       <Toaster position="top-right" toastOptions={{ style: { fontSize: '0.875rem', borderRadius: '0.375rem' } }} />
+      <audio ref={audioRef} src="/song.opus" style={{ display: 'none' }} onEnded={() => setIsPlaying(false)} />
       <div className="scanlines"></div>
       <div className="grid-bg"></div>
 
@@ -730,6 +764,11 @@ function App() {
           setIsRoot={setIsRoot}
           setIsHacked={setIsHacked}
           setIsNuking={setIsNuking}
+          audioRef={audioRef}
+          isPlaying={isPlaying}
+          setIsPlaying={setIsPlaying}
+          musicVolume={musicVolume}
+          setMusicVolume={setMusicVolume}
         />
       )}
 
