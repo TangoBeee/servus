@@ -17,9 +17,13 @@ export interface EngineContext {
   task: string;
   /** Working directory for file operations */
   cwd: string;
+  /** Directory Servus was launched from before domain-specific target resolution. */
+  launchCwd?: string;
+  /** Concrete task target root when it differs from the launch cwd. */
+  targetCwd?: string;
   /** LLM model to use for agents */
   model: string;
-  /** Agent backend (claude-code or custom) */
+  /** Agent backend */
   backend: AgentBackend;
   /** Max consecutive failures before giving up */
   maxConsecutiveFailures: number;

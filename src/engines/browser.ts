@@ -8,7 +8,7 @@
  *
  */
 
-import { createAgent, type IAgent } from "../agent.js";
+import { createAgent, type AgentResponse, type IAgent } from "../agent.js";
 import { log, ANSI, formatDuration } from "../log.js";
 import { bus } from "../events.js";
 import { createBrowserTools } from "../tools-browser.js";
@@ -17,6 +17,7 @@ import { detectClarificationRequest, stripProtocolTags } from "../clarification.
 import { updateBrowserSessionState } from "../browser-session.js";
 import { SERVUS_OPERATING_LOOP } from "../prompts/operating-loop.js";
 import { resultFromValidatedResponse } from "../agentic-loop.js";
+import { getFinalization, validateCompletion } from "../completion-validator.js";
 
 // ─── Browser System Prompts ─────────────────────────────────────────────────
 
@@ -85,10 +86,13 @@ ${SERVUS_OPERATING_LOOP}
 ### Interactive Browser (powered by Playwright)
 - \`browser_navigate\` — go to a URL in the real Chrome browser
 - \`browser_current_state\` — inspect current URL/title/session/block status
-- \`browser_snapshot\` / \`browser_observe\` — capture a compact hybrid page tree with stable refs
-- \`browser_act\` — perform one natural-language atomic browser action using the latest page snapshot
-- \`browser_click_ref\`, \`browser_fill_ref\`, \`browser_select_ref\` — deterministic ref-based actions
-- \`browser_scroll\`, \`browser_wait\`, \`browser_back\`, \`browser_hover\`, \`browser_key\` — navigation and interaction helpers
+- \`browser_snapshot\` / \`browser_observe\` — capture a compact hybrid page tree with stable refs; observe ranks actions with the model
+- \`browser_act\` — model-selected atomic action with deterministic execution, cache replay, two-step dropdown support, and self-heal
+- \`browser_agent\` — bounded mini browser controller for small high-level subtasks; stops on blockers instead of looping
+- \`browser_click_ref\`, \`browser_fill_ref\`, \`browser_select_ref\`, \`browser_hover_ref\`, \`browser_drag_ref\`, \`browser_upload_ref\` — deterministic ref-based actions
+- \`browser_scroll\`, \`browser_wait\`, \`browser_wait_for_selector\`, \`browser_back\`, \`browser_forward\`, \`browser_reload\`, \`browser_key\` — navigation and interaction helpers
+- \`browser_pages\`, \`browser_new_page\`, \`browser_select_page\`, \`browser_close_page\` — tab/page helpers
+- \`browser_element_info\`, \`browser_highlight\`, \`browser_set_viewport\`, \`browser_cookies\`, \`browser_set_headers\`, \`browser_add_init_script\` — diagnostic/context helpers
 - \`browser_click_at\`, \`browser_type_at\`, \`browser_scroll_at\` — viewport coordinate actions for visual-only controls, popups, custom dropdowns, canvas/seat maps, and UI missing from DOM refs
 - \`browser_click\`, \`browser_fill\`, \`browser_press\` — legacy aliases for observed elements/keyboard
 - \`browser_extract\` — extract text from the current page
@@ -99,8 +103,8 @@ ${SERVUS_OPERATING_LOOP}
 
 1. **Simple research?** → Use \`web_search\` + \`webfetch\` (faster, no browser needed)
 2. **Need to interact?** → Use \`browser_navigate\` to open the site.
-3. **Finding Elements?** → Call \`browser_snapshot\` to get stable action refs, roles, labels, selectors, and page state.
-4. **Acting?** → Prefer \`browser_act\` for one atomic instruction. Use ref tools when you already know the ref.
+3. **Finding Elements?** → Call \`browser_observe\` with your goal, or \`browser_snapshot\` when you need the full ref list.
+4. **Acting?** → Prefer \`browser_act\` for one atomic instruction. Use \`browser_agent\` only for a bounded small subtask, not an entire booking. Use ref tools when you already know the ref.
 5. **Visual mismatch?** → Use \`browser_snapshot\` with \`includeScreenshot: true\` or \`browser_screenshot\`; screenshots are model-visible and annotated when requested.
 6. **Need proof?** → Use \`browser_screenshot\` to capture results.
 7. **Stuck?** → Take a fresh snapshot. Do not retry the same failed action more than twice.
@@ -111,7 +115,8 @@ ${SERVUS_OPERATING_LOOP}
   as the active surface. Do not keep scrolling the background page when a popup is open.
 - For dropdown/search controls, use a two-step flow: open or fill the control,
   take/use a fresh snapshot, then select a real visible option. Prefer
-  \`browser_select_ref\` or \`browser_act\` with an explicit \`value\`.
+  \`browser_act\` with an explicit \`value\`, \`browser_select_ref\`, or
+  \`browser_agent\` for small dropdown/modal subtasks.
 - If a popup option is not visible, use \`browser_scroll\`; it targets the active
   popup/listbox first. Do not tab through the page blindly.
 - When an action result says \`Visual change detected: true\`, assume the page
@@ -218,6 +223,7 @@ export class BrowserEngine implements Engine {
         role: "researcher",
         color: ANSI.blue,
         model: ctx.model,
+        domain: "browser",
         prompt: tier2 ? TIER2_PROMPT : TIER1_PROMPT,
         extraTools: allExtraTools,
         disallowedTools: ["bash", "write", "edit", "patch", "webfetch"],
@@ -273,12 +279,21 @@ export class BrowserEngine implements Engine {
         };
       }
 
+      response = await this.repairInvalidBrowserCompletion(ctx, response);
+
       const finalized = resultFromValidatedResponse(ctx, "browser", response);
       if (finalized) {
         if (finalized.needsInput) {
           keepBrowserOpen = true;
           this.emitStatus("waiting_input");
           updateBrowserSessionState(ctx.sessionId, { status: "waiting_input" });
+        } else if (!finalized.success) {
+          keepBrowserOpen = true;
+          this.emitStatus("waiting_input");
+          updateBrowserSessionState(ctx.sessionId, {
+            status: "waiting_input",
+            blockedReason: finalized.error ?? "Browser completion was not accepted.",
+          });
         } else {
           this.emitStatus(finalized.success ? "done" : "error");
         }
@@ -360,6 +375,46 @@ export class BrowserEngine implements Engine {
 
   close(): void {
     this.agent?.close();
+  }
+
+  private async repairInvalidBrowserCompletion(
+    ctx: EngineContext,
+    response: AgentResponse,
+  ): Promise<AgentResponse> {
+    if (!this.agent) return response;
+    const finalization = getFinalization(response);
+    if (finalization?.kind !== "done") return response;
+
+    const decision = validateCompletion(ctx, "browser", response);
+    if (decision.accepted) return response;
+
+    log.warn("Browser completion failed runtime validation; asking the same session to repair evidence before closing.");
+    bus.push({
+      type: "runtime:state",
+      agent: "Browser",
+      message: "completion validation failed; repairing in same browser session",
+      metadata: { missingCriteria: decision.missingCriteria },
+    });
+    updateBrowserSessionState(ctx.sessionId, {
+      status: "open",
+      blockedReason: `Completion validation missing: ${decision.missingCriteria.join(", ")}`,
+    });
+
+    return this.agent.send([
+      "## Browser runtime validation failed",
+      "You attempted to finish, but Servus cannot accept completion yet.",
+      "Do not restart the task. Continue in this same browser session.",
+      "",
+      "Missing evidence/criteria:",
+      ...decision.missingCriteria.map((item) => `- ${item}`),
+      "",
+      "Next steps:",
+      "- Call browser_current_state.",
+      "- If the visible UI may differ from DOM text, call browser_snapshot with includeScreenshot=true.",
+      "- Gather proof with browser_screenshot or browser_extract.",
+      "- If the page is blocked, login/captcha is required, or an action failed, call servus_need_input instead of servus_done.",
+      "- Only call servus_done after the requested browser end state is actually visible and proved.",
+    ].join("\n"));
   }
 
   private emitStatus(status: "working" | "waiting_input" | "done" | "error"): void {

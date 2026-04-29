@@ -1,11 +1,11 @@
 export const COLORS = {
-  primary: "green",
-  secondary: "cyan",
-  accent: "yellow",
-  violet: "magenta",
-  blue: "blue",
-  error: "red",
-  muted: "gray",
+  primary: "#9fcf8f",
+  secondary: "#8ab4c7",
+  accent: "#c79b62",
+  violet: "#b79adf",
+  blue: "#75a7d8",
+  error: "#e06c75",
+  muted: "#7c7c7c",
   agent: {
     planner: "blue",
     developer: "green",

@@ -7,12 +7,12 @@ import {
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-export const SERVUS_DIR = join(homedir(), ".servus");
+export const SERVUS_DIR = process.env.SERVUS_DIR ?? join(process.env.SERVUS_HOME ?? homedir(), ".servus");
 const CONFIG_PATH = join(SERVUS_DIR, "config.json");
 
 export interface ServusConfig {
   defaultModel: string;
-  defaultBackend: "claude-code" | "custom" | "auto";
+  defaultBackend: "custom" | "auto";
   maxFailures: number;
   budget?: number;
   verifyCommand?: string;
@@ -38,6 +38,30 @@ export interface ServusConfig {
     args?: string[];
     url?: string;
     env?: Record<string, string>;
+    headers?: Record<string, string>;
+    timeoutMs?: number;
+    toolFilter?: string[];
+    resourceFilter?: string[];
+    transport?: "auto" | "stdio" | "streamable-http" | "sse" | "http";
+    auth?: {
+      type?: "none" | "bearer" | "header" | "oauth" | "client_credentials";
+      tokenEnv?: string;
+      headerName?: string;
+      clientIdEnv?: string;
+      clientSecretEnv?: string;
+      scopes?: string[];
+      redirectUrl?: string;
+    };
+    disabled?: boolean;
+  }>;
+  lspServers?: Record<string, {
+    command: string;
+    args?: string[];
+    env?: Record<string, string>;
+    extensions?: string[];
+    languages?: Record<string, string>;
+    languageId?: string;
+    initializationOptions?: unknown;
   }>;
   browser?: {
     headless?: boolean;
@@ -46,7 +70,13 @@ export interface ServusConfig {
   permissions?: {
     allow?: string[];
     deny?: string[];
+    mcp?: {
+      allow?: string[];
+      deny?: string[];
+      ask?: string[];
+    };
   };
+  trustedFolders?: string[];
   memory?: {
     enabled?: boolean;
     maxBytes?: number;
@@ -54,11 +84,13 @@ export interface ServusConfig {
 }
 
 const DEFAULTS: ServusConfig = {
-  defaultModel: "claude-sonnet-4-20250514",
+  defaultModel: "gpt-5.4",
   defaultBackend: "auto",
   maxFailures: 5,
   theme: "matrix",
 };
+const LEGACY_PROVIDER_BACKEND = `${"claude"}-code`;
+const REMOVED_PROVIDER_SDK_BACKEND = `${"provider"}-sdk`;
 
 export function ensureServusDir(): void {
   try {
@@ -74,10 +106,21 @@ export function loadConfig(): ServusConfig {
   if (!existsSync(CONFIG_PATH)) return { ...DEFAULTS };
   try {
     const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-    return { ...DEFAULTS, ...raw };
+    return normalizeConfig({ ...DEFAULTS, ...raw });
   } catch {
     return { ...DEFAULTS };
   }
+}
+
+function normalizeConfig(config: ServusConfig): ServusConfig {
+  return {
+    ...config,
+    defaultBackend:
+      String(config.defaultBackend) === LEGACY_PROVIDER_BACKEND ||
+      String(config.defaultBackend) === REMOVED_PROVIDER_SDK_BACKEND
+        ? "custom"
+        : config.defaultBackend,
+  };
 }
 
 export function saveConfig(config: ServusConfig): void {

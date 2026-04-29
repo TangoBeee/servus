@@ -1,638 +1,842 @@
 /**
- * Coding Engine — wraps the existing plan→develop→test→feedback loop.
+ * Coding Engine — normal execution uses the Servus coding runtime.
  *
- * This is a direct extraction of the original Orchestrator's coding logic
- * into the Engine interface, preserving all existing behavior.
+ * The historical role-loop remains as an internal emergency fallback only.
+ * Its planner/developer/tester modules are loaded lazily so the normal coding
+ * import path stays runtime-first.
  */
 
-import {
-  createAgent,
-  type IAgent,
-} from "../agent.js";
-import { PLANNER_PROMPT } from "../prompts/planner.js";
-import { DEVELOPER_PROMPT } from "../prompts/developer.js";
-import { REVIEWER_PROMPT } from "../prompts/reviewer.js";
-import { MANAGER_PROMPT } from "../prompts/manager.js";
-import {
-  runVerification,
-  readPlan,
-  writePlan,
-  findNextPendingTask,
-  countTasks,
-  type Plan,
-  type PlanTask,
-  type VerificationResult,
-} from "../verify.js";
 import { log, ANSI, truncate, formatDuration } from "../log.js";
 import { bus } from "../events.js";
 import type { Engine, EngineContext, EngineResult } from "../engine.js";
+import {
+  CodingRuntime,
+  changedFilesLabel,
+  type CodingHelperRequest,
+  type CodingHelperType,
+  type VerificationAttempt,
+} from "../coding-runtime.js";
+import {
+  finalizationToSummary,
+  getFinalization,
+} from "../completion-validator.js";
+import { CodingConversationLoop } from "../coding-conversation-loop.js";
+import {
+  ServusCodingSession,
+  codingAgentColorForMode,
+  codingAgentNameForMode,
+} from "../coding-session.js";
+import { updateProjectMemoryFromCodingRun } from "../project-memory.js";
+
 
 // ─── Coding Engine ──────────────────────────────────────────────────────────
 
 export class CodingEngine implements Engine {
   readonly name = "coding";
   readonly description =
-    "Handles software development tasks: writing, editing, debugging, building, and testing code. " +
-    "Uses a team of agents (Planner, Developer, Tester, Manager) in a plan→execute→test→feedback loop.";
+    "Handles software development tasks with a session-owned coding runtime, evidence-backed completion, checkpoints, and verification.";
 
-  private planner!: IAgent;
-  private developer!: IAgent;
-  private tester!: IAgent;
-  private manager!: IAgent;
-
-  private metrics = {
-    tasksCompleted: 0,
-    tasksFailed: 0,
-    totalVerifications: 0,
-    planRevisions: 0,
-  };
+  private primary?: CodingConversationLoop;
+  private codingSession?: ServusCodingSession;
+  private helpers: Array<{ close(): void }> = [];
+  private legacy?: Engine;
+  private helperCost = 0;
 
   async execute(ctx: EngineContext): Promise<EngineResult> {
-    const startTime = Date.now();
-    await this.createAgents(ctx);
+    this.helperCost = 0;
+    this.helpers = [];
+    if (process.env.SERVUS_INTERNAL_CODING_LEGACY === "1") {
+      const { LegacyCodingEngine } = await import("./coding-legacy.js");
+      this.legacy = new LegacyCodingEngine();
+      return await this.legacy.execute(ctx);
+    }
 
-    try {
-      await this.planPhase(ctx);
-      await this.executionPhase(ctx);
-      await this.finalVerification(ctx);
+    this.codingSession = await ServusCodingSession.start(ctx);
+    const startTime = this.codingSession.startedAt;
+    const runtime = this.codingSession.runtime;
 
-      const cost = this.totalCost();
-      return {
-        success: true,
-        summary: `Completed ${this.metrics.tasksCompleted} tasks (${this.metrics.tasksFailed} failed, ${this.metrics.totalVerifications} verifications)`,
-        cost,
-      };
-    } catch (err) {
-      const cost = this.totalCost();
+    const immediate = await this.tryRunImmediateCommand(runtime, startTime);
+    if (immediate) return immediate;
+
+    const intentQuestion = runtime.intentQuestion();
+    if (intentQuestion) {
+      runtime.setPhase("waiting_input", intentQuestion.question);
+      this.printRuntimeSummary(runtime, startTime);
       return {
         success: false,
-        summary: `Coding engine failed: ${err instanceof Error ? err.message : String(err)}`,
-        cost,
-        error: err instanceof Error ? err.message : String(err),
+        needsInput: true,
+        summary: intentQuestion.question,
+        question: intentQuestion.question,
+        questions: [intentQuestion.question],
+        questionContext: intentQuestion.summary,
+        evidence: runtime.state.evidence,
+        cost: 0,
+        error: "Needs intent clarification",
       };
-    } finally {
-      this.printSummary(startTime);
-    }
-  }
-
-  close(): void {
-    this.planner?.close();
-    this.developer?.close();
-    this.tester?.close();
-    this.manager?.close();
-  }
-
-  // ── Agent Creation ──────────────────────────────────────────────────────
-
-  private async createAgents(ctx: EngineContext): Promise<void> {
-    const { model, backend, cwd } = ctx;
-    const opts = { cwd };
-
-    log.info(`Backend: ${backend === "claude-code" ? "Claude Code SDK" : "Custom AI SDK (multi-provider)"}`);
-
-    [this.planner, this.developer, this.tester, this.manager] =
-      await Promise.all([
-        createAgent(backend, {
-          name: "Planner",
-          role: "architect",
-          color: ANSI.blue,
-          model,
-          prompt: PLANNER_PROMPT,
-          sessionId: ctx.sessionId,
-        }, opts),
-        createAgent(backend, {
-          name: "Developer",
-          role: "builder",
-          color: ANSI.green,
-          model,
-          prompt: DEVELOPER_PROMPT,
-          sessionId: ctx.sessionId,
-        }, opts),
-        createAgent(backend, {
-          name: "Tester",
-          role: "qa",
-          color: ANSI.yellow,
-          model,
-          prompt: REVIEWER_PROMPT,
-          sessionId: ctx.sessionId,
-        }, opts),
-        createAgent(backend, {
-          name: "Manager",
-          role: "lead",
-          color: ANSI.magenta,
-          model,
-          prompt: MANAGER_PROMPT,
-          sessionId: ctx.sessionId,
-        }, opts),
-      ]);
-
-    log.success("All agents initialized");
-  }
-
-  // ── Phase 1: Planning ──────────────────────────────────────────────────
-
-  private async planPhase(ctx: EngineContext): Promise<void> {
-    log.phase("PHASE 1 — ARCHITECT ANALYSES THE CODEBASE");
-
-    const planRequest = [
-      `## Task`,
-      ctx.task,
-      ``,
-      `## Working Directory`,
-      `\`${ctx.cwd}\``,
-      ``,
-      `## Instructions`,
-      `Analyse this project thoroughly. Then write \`servus-plan.json\` and \`init.sh\`.`,
-      `Signal <plan_status>READY</plan_status> when both files are written.`,
-    ].join("\n");
-
-    this.emitAgentStatus("Planner", "working");
-    let response = await this.planner.send(planRequest);
-    this.emitAgentStatus("Planner", "done");
-
-    // Retry if plan wasn't created
-    let plan = readPlan(ctx.cwd);
-    let retries = 0;
-
-    while (!plan && retries < 3) {
-      retries++;
-      log.warn(`Plan file not found. Asking Planner to retry (${retries}/3)...`);
-      this.emitAgentStatus("Planner", "working");
-      response = await this.planner.send(
-        `servus-plan.json was not created or is invalid JSON. ` +
-          `Please create it now following the schema, then signal <plan_status>READY</plan_status>.`,
-      );
-      this.emitAgentStatus("Planner", "done");
-      plan = readPlan(ctx.cwd);
     }
 
-    if (!plan) {
-      log.error("Planner failed to create a valid plan after 3 retries.");
-      throw new Error("Planning failed");
-    }
-
-    const counts = countTasks(plan);
-    log.success(
-      `Plan created: ${counts.total} tasks across ${plan.phases.length} phases`,
-    );
-
-    // Manager reviews the plan
-    log.phase("MANAGER REVIEWS THE PLAN");
-
-    const planSummary = summarisePlan(plan);
-    this.emitAgentStatus("Manager", "working");
-    const reviewResponse = await this.manager.send(
-      [
-        `## Plan Review Request`,
-        ``,
-        `The Architect has produced the following plan for: "${ctx.task}"`,
-        ``,
-        planSummary,
-        ``,
-        `Review this plan. If acceptable, output <decision>APPROVE</decision>.`,
-        `If changes are needed, output <decision>REVISE</decision> with specifics.`,
-      ].join("\n"),
-    );
-    this.emitAgentStatus("Manager", "done");
-
-    if (reviewResponse.text.includes("<decision>REPLAN</decision>")) {
-      this.metrics.planRevisions++;
-      log.warn("Manager requested a replan. Sending feedback to Planner...");
-
-      this.emitAgentStatus("Planner", "working");
-      await this.planner.send(
-        `The Manager has reviewed your plan and requested revisions:\n\n` +
-          `${reviewResponse.text}\n\n` +
-          `Update servus-plan.json accordingly and signal <plan_status>READY</plan_status>.`,
-      );
-      this.emitAgentStatus("Planner", "done");
-
-      // Re-read plan
-      plan = readPlan(ctx.cwd);
-      if (!plan) throw new Error("Replanning failed — no valid plan file");
-    }
-
-    log.success("Plan approved. Moving to execution.");
-  }
-
-  // ── Phase 2: Execution ─────────────────────────────────────────────────
-
-  private async executionPhase(ctx: EngineContext): Promise<void> {
-    log.phase("PHASE 2 — EXECUTING THE PLAN");
-
-    while (true) {
-      // Budget check
-      if (this.isBudgetExhausted(ctx)) {
-        log.error("Budget exhausted. Stopping execution.");
-        throw new Error("Budget limit reached");
-      }
-
-      const plan = readPlan(ctx.cwd);
-      if (!plan) {
-        log.error("Plan file missing during execution.");
-        throw new Error("servus-plan.json not found");
-      }
-
-      const counts = countTasks(plan);
-      bus.push({
-        type: "info",
-        message: `Tasks ${counts.completed}/${counts.total}`,
-        metadata: { total: counts.total, completed: counts.completed },
+    await this.runPreflightHelpers(ctx, runtime);
+    if (this.isRuntimeBudgetExceeded(ctx)) {
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: false,
+        summary: `Coding budget limit reached during preflight helpers. Budget: $${ctx.maxBudgetUsd?.toFixed(4)}, cost: $${this.runtimeCost().toFixed(4)}.`,
+        evidence: runtime.state.evidence,
+        cost: this.runtimeCost(),
+        error: "Budget limit reached",
       });
-
-      const next = findNextPendingTask(plan);
-      if (!next) {
-        log.success(
-          `All tasks processed: ${counts.completed} completed, ${counts.failed} failed`,
-        );
-        break;
-      }
-
-      const { task } = next;
-      await this.executeTask(ctx, plan, task);
     }
-  }
 
-  // ── Single Task Lifecycle ──────────────────────────────────────────────
-
-  private async executeTask(ctx: EngineContext, plan: Plan, task: PlanTask): Promise<void> {
-    const counts = countTasks(plan);
-    log.phase(
-      `TASK ${task.id} — ${task.description} [${counts.completed + 1}/${counts.total}]`,
-    );
-
-    // Mark in_progress
-    task.status = "in_progress";
-    writePlan(ctx.cwd, plan);
-
-    let consecutiveFailures = 0;
-    const maxAttempts = ctx.maxConsecutiveFailures;
-    const maxContinueWithoutDone = 3;
-    let continueWithoutDone = 0;
-
-    let testerRateLimitRetries = 0;
-
-    while (consecutiveFailures < maxAttempts) {
-      // ── Step A: Developer implements ──────────────────────────────
-
-      const devMessage =
-        consecutiveFailures === 0 && continueWithoutDone === 0
-          ? this.buildTaskAssignment(task, plan)
-          : `Continue working on task ${task.id}. You have not signaled completion yet. Use your tools to implement, then run verification, then output <task_status>DONE</task_status>.`;
-
-      this.emitAgentStatus("Developer", "working");
-      const devResponse = await this.developer.send(devMessage);
-      this.emitAgentStatus("Developer", "done");
-
-      if (!devResponse.text.includes("<task_status>DONE</task_status>")) {
-        if (devResponse.subtype === "error_max_turns") {
-          log.warn("Developer hit turn limit. Sending continuation...");
-          continueWithoutDone++;
-          if (continueWithoutDone >= maxContinueWithoutDone) {
-            log.error(
-              `Developer did not signal completion after ${maxContinueWithoutDone} attempts. Marking task as failed.`,
-            );
-            task.status = "failed";
-            task.failure_reason = "Developer did not signal DONE after multiple attempts";
-            writePlan(ctx.cwd, plan);
-            this.metrics.tasksFailed++;
-            return;
-          }
-          continue;
-        }
-        continueWithoutDone++;
-        if (continueWithoutDone >= maxContinueWithoutDone) {
-          log.error(
-            `Developer did not signal completion after ${maxContinueWithoutDone} attempts. Marking task as failed.`,
-          );
-          task.status = "failed";
-          task.failure_reason = "Developer did not signal DONE after multiple attempts";
-          writePlan(ctx.cwd, plan);
-          this.metrics.tasksFailed++;
-          return;
-        }
-        continue;
-      }
-
-      continueWithoutDone = 0;
-
-      // ── Step B: Tester verifies ──────────────────────────────────
-
-      log.info("Developer signals done. Sending to Tester...");
-
-      const testRequest = [
-        `## Test Task ${task.id}: ${task.description}`,
-        ``,
-        `**Original user task**: "${truncate(ctx.task, 2000)}"`,
-        ``,
-        `The Developer says this task is complete. You must verify both (1) technical checks and (2) that the work actually satisfies the task.`,
-        ``,
-        `1. **Technical verification**`,
-        `   - Run \`bash init.sh\` (or the project's test/build commands).`,
-        `   - Use \`Read\` and \`Grep\` to review the modified files.`,
-        `   - Check for anti-patterns (no test weakening, no type/lint bypass).`,
-        ``,
-        `2. **End-to-end / behavioral verification**`,
-        `   - Confirm that the implementation matches the task and the user's goal.`,
-        `   - Read the relevant code (e.g. components, handlers) and verify the described behavior is present.`,
-        `   - If the task or user goal is not satisfied, output <test_result>FAIL</test_result> with a clear explanation.`,
-        ``,
-        `Output <test_result>PASS</test_result> only if both technical checks and behavioral verification pass. Otherwise output <test_result>FAIL</test_result>.`,
-      ].join("\n");
-
-      this.emitAgentStatus("Tester", "working");
-      const testResponse = await this.tester.send(testRequest);
-      this.emitAgentStatus("Tester", "done");
-      this.metrics.totalVerifications++;
-
-      if (testResponse.subtype === "error_rate_limit") {
-        log.warn(
-          "Tester hit a rate limit / token cap. Retrying verification...",
+    this.primary = this.codingSession.createLoop({
+      agentName: codingAgentNameForMode(runtime.state.mode),
+      color: codingAgentColorForMode(runtime.state.mode),
+      model: runtime.state.command?.custom?.model ?? ctx.model,
+      systemPrompt: runtime.buildSystemPrompt(),
+      disallowedTools: primaryDisallowedTools(runtime),
+      runTaskHelper: async (request) => {
+        await this.runHelper(
+          ctx,
+          runtime,
+          request.type,
+          `Task ${request.id}: ${request.description}`,
+          request.prompt,
+          request.id,
         );
-        testerRateLimitRetries++;
-        this.tester.close();
-        const delayMs = Math.min(30_000, 3_000 * 2 ** (testerRateLimitRetries - 1));
-        await new Promise((r) => setTimeout(r, delayMs));
-        if (testerRateLimitRetries >= 3) {
-          log.error("Tester was rate limited repeatedly. Marking task as failed.");
-          task.status = "failed";
-          task.failure_reason = "Tester repeatedly hit model rate limits.";
-          writePlan(ctx.cwd, plan);
-          this.metrics.tasksFailed++;
-          return;
-        }
-        continue;
-      }
+        return runtime.buildHelperReturnMessage([request]);
+      },
+    });
 
-      if (testResponse.text.includes("<test_result>PASS</test_result>")) {
-        // ── SUCCESS ─────────────────────────────────────────────────
+    let message = [
+      runtime.buildInitialMessage(),
+      runtime.buildHelperContextMessage(),
+    ].filter(Boolean).join("\n\n");
+    let lastVerification: VerificationAttempt | undefined;
+    const maxAttempts = Math.max(1, ctx.maxConsecutiveFailures);
 
-        log.success(`Task ${task.id} PASSED`);
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      runtime.setPhase(
+        attempt === 0
+          ? initialPhaseForMode(runtime.state.mode)
+          : "repairing",
+        attempt === 0 ? "Running coding agent" : `Repair attempt ${attempt + 1}`,
+      );
 
-        task.status = "completed";
-        writePlan(ctx.cwd, plan);
-        this.metrics.tasksCompleted++;
-        const countsAfter = countTasks(plan);
-        bus.push({
-          type: "task:complete",
-          message: `Task ${task.id} completed`,
-          metadata: { total: countsAfter.total, completed: countsAfter.completed },
+      const turn = this.codingSession.beginTurn(message, { attempt, mode: runtime.state.mode });
+      const response = await this.primary.send(message);
+      turn.finish(response);
+      runtime.absorbAgentResponse(response);
+      if (this.isRuntimeBudgetExceeded(ctx)) {
+        return await this.finalizeRuntime(runtime, startTime, {
+          success: false,
+          summary: `Coding budget limit reached. Budget: $${ctx.maxBudgetUsd?.toFixed(4)}, cost: $${this.runtimeCost().toFixed(4)}.`,
+          evidence: runtime.state.evidence,
+          cost: this.runtimeCost(),
+          error: "Budget limit reached",
         });
-
-        return;
       }
 
-      // ── FAILURE — escalate to Manager ─────────────────────────────
-
-      consecutiveFailures++;
-      log.error(
-        `Task ${task.id} FAILED test (${consecutiveFailures}/${maxAttempts})`,
-      );
-
-      const isRetry = consecutiveFailures >= 1;
-      const managerRequest = [
-        `## Test Failure Report — Task ${task.id}`,
-        ``,
-        `**Task**: ${task.description}`,
-        `**Attempt**: ${consecutiveFailures}/${maxAttempts}`,
-        isRetry
-          ? `**IMPORTANT**: The Developer has already tried and failed. Give CONCRETE steps.`
-          : "",
-        ``,
-        `### Tester's Report`,
-        truncate(testResponse.text, 3000),
-        ``,
-        `Analyse the failure. Provide SPECIFIC, ACTIONABLE feedback for the Developer.`,
-        ``,
-        consecutiveFailures >= maxAttempts - 1
-          ? `This is the LAST attempt. Consider suggesting a fundamentally different approach.`
-          : `Output <decision>REVISE</decision> with your feedback.`,
-      ]
-        .filter(Boolean)
-        .join("\n");
-
-      this.emitAgentStatus("Manager", "working");
-      const managerResponse = await this.manager.send(managerRequest);
-      this.emitAgentStatus("Manager", "done");
-
-      if (managerResponse.text.includes("<decision>REPLAN</decision>")) {
-        log.warn("Manager requested a replan for this task.");
-        task.status = "failed";
-        task.failure_reason = "Manager requested replan";
-        writePlan(ctx.cwd, plan);
-        this.metrics.tasksFailed++;
-        await this.triggerReplan(ctx, plan);
-        return;
+      const helperRequests = runtime.takePendingHelperRequests();
+      if (helperRequests.length > 0) {
+        await this.runRequestedHelpers(ctx, runtime, helperRequests);
+        message = runtime.buildHelperReturnMessage(helperRequests);
+        continue;
       }
 
-      // Forward Manager's feedback to Developer
-      const retryPreamble =
-        consecutiveFailures >= 1
-          ? [
-              `**RETRY**: Your previous attempt failed verification. Do NOT repeat the same steps.`,
-              `Follow the Manager's feedback exactly.`,
-              ``,
-            ].join("\n")
-          : "";
-      this.emitAgentStatus("Developer", "working");
-      await this.developer.send(
-        [
-          `## Manager Feedback — Task ${task.id} (attempt ${consecutiveFailures}/${maxAttempts})`,
-          ``,
-          retryPreamble,
-          `The Tester found issues. The Manager has analysed them:`,
-          ``,
-          truncate(managerResponse.text, 3000),
-          ``,
-          `Fix the issues, re-validate, and signal <task_status>DONE</task_status> when ready.`,
-        ].join("\n"),
-      );
-      this.emitAgentStatus("Developer", "done");
-    }
-
-    // Exhausted all attempts — mark failed.
-    log.error(`Task ${task.id} failed after ${maxAttempts} attempts.`);
-
-    task.status = "failed";
-    task.failure_reason = `Failed after ${maxAttempts} consecutive attempts`;
-    writePlan(ctx.cwd, plan);
-    this.metrics.tasksFailed++;
-
-    log.warn("Max attempts reached. Manual intervention is recommended.");
-  }
-
-  // ── Final Verification ─────────────────────────────────────────────────
-
-  private async finalVerification(ctx: EngineContext): Promise<void> {
-    log.phase("FINAL VERIFICATION");
-
-    const verification = await runVerification(ctx.cwd, ctx.verifyCommand);
-    this.metrics.totalVerifications++;
-
-    if (verification.ok) {
-      log.success("Final verification PASSED");
-      return;
-    }
-
-    log.warn("Final verification failed. Running emergency fix cycle...");
-    await this.emergencyFixCycle(ctx, verification);
-  }
-
-  private async emergencyFixCycle(ctx: EngineContext, initial: VerificationResult): Promise<void> {
-    let lastResult = initial;
-
-    for (let attempt = 0; attempt < ctx.maxConsecutiveFailures; attempt++) {
-      const devMessage = [
-        `## Emergency Fix — Final Verification Failed`,
-        ``,
-        `The project's final verification (\`${lastResult.command}\`) is failing.`,
-        ``,
-        `### Errors`,
-        `\`\`\``,
-        truncate(lastResult.stderr, 3000),
-        `\`\`\``,
-        lastResult.stdout
-          ? `### Stdout\n\`\`\`\n${truncate(lastResult.stdout, 1500)}\n\`\`\``
-          : "",
-        ``,
-        `Fix ALL errors. Signal <task_status>DONE</task_status> when ready.`,
-      ].join("\n");
-
-      const devResponse = await this.developer.send(devMessage);
-
-      if (devResponse.text.includes("<task_status>DONE</task_status>")) {
-        const verification = await runVerification(ctx.cwd, ctx.verifyCommand);
-        this.metrics.totalVerifications++;
-
-        if (verification.ok) {
-          log.success("Emergency fix resolved all issues!");
-          return;
+      const finalization = getFinalization(response);
+      if (
+        !finalization &&
+        ["error_rate_limit", "error_stream_protocol", "error_max_turns"].includes(response.subtype)
+      ) {
+        if (attempt >= maxAttempts - 1) {
+          const summary = `Coding agent stopped before completion evidence was available (${response.subtype}).`;
+          return await this.finalizeRuntime(runtime, startTime, {
+            success: false,
+            summary,
+            evidence: runtime.state.evidence,
+            cost: this.runtimeCost(),
+            error: response.text,
+          });
         }
-
-        lastResult = verification;
-        log.error(
-          `Emergency fix attempt ${attempt + 1} still failing. ` +
-            `(${ctx.maxConsecutiveFailures - attempt - 1} attempts left)`,
-        );
+        message = runtime.buildTransientRecoveryMessage(response);
+        continue;
       }
+
+      if (finalization?.kind === "need_input") {
+        runtime.setPhase("waiting_input", finalization.question ?? "Needs user input");
+        const question = finalization.question ?? finalization.summary ?? "I need one more detail to continue.";
+        return {
+          success: false,
+          needsInput: true,
+          summary: question,
+          question,
+          questions: finalization.questions ?? [question],
+          questionContext: finalization.summary,
+          ...(finalization.choices?.length ? {
+            clarification: {
+              mode: "blocking_facts",
+              message: question,
+              context: finalization.summary ?? question,
+              questions: finalization.questions ?? [question],
+              choices: finalization.choices,
+              sameSession: true,
+            },
+          } : {}),
+          cost: this.runtimeCost(),
+          error: "Needs user input",
+        };
+      }
+
+      const checkpoint = await runtime.createCheckpoint(response);
+      await this.runReviewHelperIfNeeded(ctx, runtime, checkpoint.changedFiles);
+
+      if (runtime.shouldVerifyAfterResponse(response)) {
+        lastVerification = await runtime.verify("project");
+      }
+      await this.runVerificationHelperIfNeeded(
+        ctx,
+        runtime,
+        checkpoint.changedFiles,
+        lastVerification,
+      );
+
+      const decision = runtime.validateCompletion(response, lastVerification);
+      if (decision.accepted) {
+        const checkpoint = runtime.state.checkpoints.at(-1);
+        const artifacts = [...new Set([...(finalization?.artifacts ?? []), ...runtime.state.artifacts])];
+        const summary = [
+          finalizationToSummary(response),
+          "",
+          runtime.state.mode === "build"
+            ? `Changed files: ${changedFilesLabel(checkpoint?.changedFiles ?? [])}`
+            : `Mode: read-only ${runtime.state.mode}`,
+          lastVerification ? `Verification: ${lastVerification.status} (${lastVerification.command})` : undefined,
+        ].filter(Boolean).join("\n");
+        return await this.finalizeRuntime(runtime, startTime, {
+          success: true,
+          summary,
+          artifacts,
+          evidence: runtime.state.evidence,
+          cost: this.runtimeCost(),
+        });
+      }
+
+      if (attempt >= maxAttempts - 1) {
+        const summary = [
+          "Coding agent did not provide enough verified evidence to complete the task.",
+          "",
+          "Missing criteria:",
+          ...decision.missing.map((item) => `- ${item}`),
+          lastVerification?.status === "failed" ? "" : undefined,
+          lastVerification?.status === "failed" ? `Last verification failed: ${lastVerification.command}` : undefined,
+        ].filter(Boolean).join("\n");
+        return await this.finalizeRuntime(runtime, startTime, {
+          success: false,
+          summary,
+          evidence: runtime.state.evidence,
+          cost: this.runtimeCost(),
+          error: "Completion validator rejected coding result",
+        });
+      }
+
+      message = lastVerification?.status === "failed"
+        ? runtime.buildRepairMessage(lastVerification, decision)
+        : runtime.buildValidationRepairMessage(decision, lastVerification);
     }
 
-    log.error(
-      "Emergency fix cycle exhausted. The project may need manual intervention.",
-    );
-  }
-
-  // ── Helpers ─────────────────────────────────────────────────────────────
-
-  private buildTaskAssignment(task: PlanTask, plan: Plan): string {
-    const counts = countTasks(plan);
-    return [
-      `## Assigned Task: ${task.id}`,
-      ``,
-      `**Description**: ${task.description}`,
-      task.target_files?.length
-        ? `**Target Files**: ${task.target_files.join(", ")}`
-        : "",
-      task.verification
-        ? `**Verification Command**: \`${task.verification}\``
-        : "",
-      ``,
-      `**Progress**: ${counts.completed}/${counts.total} tasks completed`,
-      ``,
-      `Implement this task fully. Follow the Generate → Validate → Fix cycle.`,
-      `When implementation is done AND validation passes, output:`,
-      `  <task_status>DONE</task_status>`,
-    ]
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  private async triggerReplan(ctx: EngineContext, plan: Plan): Promise<void> {
-    this.metrics.planRevisions++;
-    log.phase("REPLANNING");
-
-    const counts = countTasks(plan);
-    this.emitAgentStatus("Planner", "working");
-    await this.planner.send(
-      [
-        `## Replan Request`,
-        ``,
-        `Progress so far: ${counts.completed} completed, ${counts.failed} failed, ${counts.pending} pending.`,
-        `The Manager determined the current plan needs restructuring.`,
-        ``,
-        `Re-analyse the codebase, considering what has already been done,`,
-        `and update servus-plan.json with a revised approach.`,
-        `Reset failed tasks to "pending" with a new strategy.`,
-        `Signal <plan_status>READY</plan_status> when done.`,
-      ].join("\n"),
-    );
-    this.emitAgentStatus("Planner", "done");
-
-    // Notify dashboard of the new plan so counters reset
-    const newPlan = readPlan(ctx.cwd);
-    if (newPlan) {
-      const newCounts = countTasks(newPlan);
-      bus.push({
-        type: "info",
-        message: `Plan revised: ${newCounts.total} tasks (${newCounts.completed} done, ${newCounts.pending} pending)`,
-        metadata: { total: newCounts.total, completed: newCounts.completed },
-      });
-    }
-  }
-
-  private emitAgentStatus(agent: string, status: "working" | "done" | "idle" | "error"): void {
-    bus.push({
-      type: "agent:status",
-      agent,
-      message: status,
+    const summary = "Coding agent stopped without satisfying runtime completion criteria.";
+    return await this.finalizeRuntime(runtime, startTime, {
+      success: false,
+      summary,
+      evidence: runtime.state.evidence,
+      cost: this.runtimeCost(),
+      error: "Runtime repair limit exceeded",
     });
   }
 
-  private totalCost(): number {
-    return (
-      (this.planner?.cost ?? 0) +
-      (this.developer?.cost ?? 0) +
-      (this.tester?.cost ?? 0) +
-      (this.manager?.cost ?? 0)
-    );
+  close(): void {
+    this.primary?.close();
+    this.codingSession?.close();
+    for (const helper of this.helpers) helper.close();
+    this.legacy?.close();
   }
 
-  private isBudgetExhausted(ctx: EngineContext): boolean {
-    if (ctx.maxBudgetUsd === undefined) return false;
-    return this.totalCost() >= ctx.maxBudgetUsd;
+  private runtimeCost(): number {
+    return (this.primary?.cost ?? 0) + this.helperCost;
   }
 
-  private printSummary(startTime: number): void {
+  private isRuntimeBudgetExceeded(ctx: EngineContext): boolean {
+    return ctx.maxBudgetUsd !== undefined && this.runtimeCost() >= ctx.maxBudgetUsd;
+  }
+
+  private printRuntimeSummary(runtime: CodingRuntime, startTime: number): void {
     const elapsed = Date.now() - startTime;
-    const totalCost = this.totalCost();
-
-    log.phase("SESSION SUMMARY");
-    log.info(`Duration           : ${formatDuration(elapsed)}`);
-    log.info(`Tasks completed    : ${this.metrics.tasksCompleted}`);
-    log.info(`Tasks failed       : ${this.metrics.tasksFailed}`);
-    log.info(`Verifications run  : ${this.metrics.totalVerifications}`);
-    log.info(`Plan revisions     : ${this.metrics.planRevisions}`);
-    log.info(`Total cost         : $${totalCost.toFixed(4)}`);
-    log.detail(`  Planner  : $${(this.planner?.cost ?? 0).toFixed(4)}`);
-    log.detail(`  Developer: $${(this.developer?.cost ?? 0).toFixed(4)}`);
-    log.detail(`  Tester   : $${(this.tester?.cost ?? 0).toFixed(4)}`);
-    log.detail(`  Manager  : $${(this.manager?.cost ?? 0).toFixed(4)}`);
+    log.phase("CODING RUNTIME SUMMARY");
+    log.info(`Mode              : ${runtime.state.mode}`);
+    log.info(`Duration          : ${formatDuration(elapsed)}`);
+    log.info(`Checkpoints       : ${runtime.state.checkpoints.length}`);
+    log.info(`Verifications     : ${runtime.state.verificationAttempts.length}`);
+    log.info(`Evidence items    : ${runtime.state.evidence.length}`);
+    log.info(`Cost              : $${this.runtimeCost().toFixed(4)}`);
   }
-}
 
-// ─── Plan Summary Helper ────────────────────────────────────────────────────
+  private async finalizeRuntime(
+    runtime: CodingRuntime,
+    startTime: number,
+    result: EngineResult,
+  ): Promise<EngineResult> {
+    const stopResults = await runtime.runStopHooks(result.summary, !result.success);
+    const blocking = stopResults.filter((hook) => hook.blocked);
+    const finalResult = blocking.length > 0
+      ? {
+          ...result,
+          success: false,
+          summary: [
+            result.summary,
+            "",
+            "Servus Stop hook blocked finalization.",
+            ...blocking.map((hook) => [
+              `- ${hook.source} ${hook.hook.type} hook${hook.hook.command ? ` (${hook.hook.command})` : ""}`,
+              hook.output ? `  Output: ${hook.output}` : undefined,
+            ].filter(Boolean).join("\n")),
+          ].join("\n"),
+          error: result.error ?? "Stop hook blocked finalization",
+        }
+      : result;
 
-function summarisePlan(plan: Plan): string {
-  const lines: string[] = [`**Task**: ${plan.task}`, ""];
-
-  for (const phase of plan.phases) {
-    lines.push(`### Phase ${phase.id}: ${phase.name}`);
-    for (const task of phase.tasks) {
-      const files = task.target_files?.join(", ") ?? "—";
-      lines.push(`- [${task.status}] **${task.id}**: ${task.description} (${files})`);
+    if (finalResult.success) {
+      runtime.complete(finalResult.summary, finalResult.artifacts ?? []);
+      const memory = updateProjectMemoryFromCodingRun({
+        cwd: runtime.state.targetCwd,
+        sessionId: runtime.state.sessionId,
+        task: runtime.state.task,
+        summary: finalResult.summary,
+        success: true,
+        repo: runtime.state.repo,
+        checkpoints: runtime.state.checkpoints,
+        verificationAttempts: runtime.state.verificationAttempts,
+      });
+      if (memory.updated) {
+        bus.push({
+          type: "coding:memory",
+          agent: "CodingRuntime",
+          message: memory.added.length
+            ? `Updated project memory with ${memory.added.length} durable item(s).`
+            : `Observed ${memory.observed.length} project memory candidate(s).`,
+          metadata: {
+            memoryPath: memory.memoryPath,
+            indexPath: memory.indexPath,
+            added: memory.added,
+            observed: memory.observed,
+          },
+        });
+      }
+    } else {
+      runtime.fail(finalResult.summary);
     }
-    lines.push("");
+    bus.push({
+      type: "coding:final_summary",
+      agent: "CodingRuntime",
+      message: finalResult.summary,
+      metadata: {
+        success: finalResult.success,
+        artifacts: finalResult.artifacts ?? [],
+        evidenceCount: finalResult.evidence?.length ?? 0,
+      },
+    });
+    this.printRuntimeSummary(runtime, startTime);
+    return finalResult;
   }
 
-  return lines.join("\n");
+  private async tryRunImmediateCommand(runtime: CodingRuntime, startTime: number): Promise<EngineResult | null> {
+    const command = runtime.state.command;
+    if (!command?.immediate) return null;
+
+    if (command.name === "verify") {
+      const attempt = await runtime.verify("project", command.args);
+      const summary = [
+        attempt.status === "passed"
+          ? "Verification passed."
+          : attempt.status === "skipped"
+            ? "Verification skipped."
+            : "Verification failed.",
+        `Command: ${attempt.command}`,
+        `Duration: ${formatDuration(attempt.durationMs)}`,
+        attempt.failureCategory ? `Failure category: ${attempt.failureCategory}` : undefined,
+        attempt.stderr ? `\nSTDERR:\n${truncate(attempt.stderr, 4000)}` : undefined,
+        attempt.stdout ? `\nSTDOUT:\n${truncate(attempt.stdout, 4000)}` : undefined,
+      ].filter(Boolean).join("\n");
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: attempt.status === "passed",
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+        ...(attempt.status === "failed" ? { error: "Verification failed" } : {}),
+        ...(attempt.status === "skipped" ? { error: "Verification skipped" } : {}),
+      });
+    }
+
+    if (command.name === "status") {
+      const summary = await runtime.buildStatusSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "transcript") {
+      const summary = runtime.buildTranscriptSummary(command.args);
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "help") {
+      const summary = runtime.buildHelpSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "tools") {
+      const summary = runtime.buildToolsSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "sessions" || command.name === "search") {
+      const summary = runtime.buildSessionsSummary(command.args);
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "diff") {
+      const result = await runtime.buildDiffSummary(command.args || "latest");
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary: result.summary,
+        evidence: runtime.state.evidence,
+        artifacts: result.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "revert") {
+      const result = await runtime.revertCheckpoint(command.args || "latest");
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: result.ok,
+        summary: result.summary,
+        evidence: runtime.state.evidence,
+        artifacts: result.artifacts,
+        cost: 0,
+        ...(result.ok ? {} : { error: "Checkpoint revert failed" }),
+      });
+    }
+
+    if (command.name === "compact") {
+      bus.push({
+        type: "context:compact",
+        agent: "CodingRuntime",
+        message: "Manual coding compaction boundary requested",
+        metadata: { sessionId: runtime.state.sessionId, mode: runtime.state.mode },
+      });
+      const summary = [
+        "Manual compaction requested.",
+        "Servus uses model-aware automatic compaction for agent history. This command records a compaction boundary for the coding session; active model history will compact before the next send when it crosses the configured threshold.",
+        "",
+        await runtime.buildStatusSummary(),
+      ].join("\n");
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "context") {
+      const summary = runtime.buildContextSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "remember") {
+      const result = runtime.rememberInstruction(command.args);
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: result.ok,
+        summary: result.summary,
+        evidence: runtime.state.evidence,
+        artifacts: result.artifacts,
+        cost: 0,
+        ...(result.ok ? {} : { error: "Memory update failed" }),
+      });
+    }
+
+    if (command.name === "memory") {
+      const summary = runtime.buildMemorySummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "files") {
+      const summary = await runtime.buildFilesSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "agents") {
+      const summary = runtime.buildAgentsSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "commands") {
+      const summary = runtime.buildCommandsSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "model" || command.name === "models") {
+      const summary = runtime.buildModelsSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "permissions") {
+      const summary = runtime.buildPermissionsSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "hooks") {
+      const summary = runtime.buildHooksSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "settings") {
+      const summary = runtime.buildSettingsSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "skills") {
+      const summary = runtime.buildSkillsSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "output-style") {
+      const result = runtime.buildOutputStylesSummary(command.args);
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: result.ok,
+        summary: result.summary,
+        evidence: runtime.state.evidence,
+        artifacts: result.artifacts,
+        cost: 0,
+        ...(result.ok ? {} : { error: "Output style not found" }),
+      });
+    }
+
+    if (command.name === "doctor") {
+      const summary = await runtime.buildDoctorSummary();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: true,
+        summary,
+        evidence: runtime.state.evidence,
+        artifacts: runtime.state.artifacts,
+        cost: 0,
+      });
+    }
+
+    if (command.name === "init") {
+      const result = runtime.initializeProjectFiles();
+      return await this.finalizeRuntime(runtime, startTime, {
+        success: result.ok,
+        summary: result.summary,
+        evidence: runtime.state.evidence,
+        artifacts: result.artifacts,
+        cost: 0,
+        ...(result.ok ? {} : { error: "Servus project initialization failed" }),
+      });
+    }
+
+    return null;
+  }
+
+  private async runPreflightHelpers(ctx: EngineContext, runtime: CodingRuntime): Promise<void> {
+    if (!runtime.shouldRunPlanHelper()) return;
+    const responseText = await this.runHelper(ctx, runtime, "plan", "Read-only preflight implementation planning");
+    if (responseText && runtime.state.planApproval.required && runtime.state.planApproval.status === "pending") {
+      runtime.markPlanReady(responseText, ["plan helper"]);
+    }
+  }
+
+  private async runReviewHelperIfNeeded(ctx: EngineContext, runtime: CodingRuntime, changedFiles: string[]): Promise<void> {
+    if (!runtime.shouldRunReviewHelper(changedFiles)) return;
+    await this.runHelper(ctx, runtime, "review", `Read-only review of ${changedFiles.length} changed file(s)`);
+  }
+
+  private async runVerificationHelperIfNeeded(
+    ctx: EngineContext,
+    runtime: CodingRuntime,
+    changedFiles: string[],
+    verification: VerificationAttempt | undefined,
+  ): Promise<void> {
+    if (!runtime.shouldRunVerificationHelper(changedFiles, verification)) return;
+    await this.runHelper(ctx, runtime, "verification", `Independent verification of ${changedFiles.length} changed file(s)`);
+  }
+
+  private async runRequestedHelpers(
+    ctx: EngineContext,
+    runtime: CodingRuntime,
+    requests: CodingHelperRequest[],
+  ): Promise<void> {
+    const serial: CodingHelperRequest[] = [];
+    const parallel: CodingHelperRequest[] = [];
+    for (const request of requests) {
+      const custom = runtime.getCodingAgent(request.type);
+      if (request.type === "worker" || custom?.readOnly === false) serial.push(request);
+      else parallel.push(request);
+    }
+
+    await Promise.all(parallel.map((request) =>
+      this.runHelper(
+        ctx,
+        runtime,
+        request.type,
+        `Task ${request.id}: ${request.description}`,
+        request.prompt,
+        request.id,
+      )
+    ));
+
+    for (const request of serial) {
+      await this.runHelper(
+        ctx,
+        runtime,
+        request.type,
+        `Task ${request.id}: ${request.description}`,
+        request.prompt,
+        request.id,
+      );
+    }
+  }
+
+  private async runHelper(
+    ctx: EngineContext,
+    runtime: CodingRuntime,
+    type: CodingHelperType,
+    summary: string,
+    requestedPrompt?: string,
+    requestId?: string,
+  ): Promise<string | undefined> {
+    const helperRun = runtime.startHelperRun(type, summary, requestId);
+    const customAgent = runtime.getCodingAgent(type);
+    const helper = new CodingConversationLoop(ctx, runtime, {
+      agentName: runtime.helperAgentName(type, helperRun),
+      color: type === "review" ? ANSI.yellow : ANSI.blue,
+      model: customAgent?.model && customAgent.model !== "inherit"
+        ? customAgent.model
+        : helperModelFor(ctx.model, type),
+      systemPrompt: runtime.buildHelperSystemPrompt(type),
+      disallowedTools: helperDisallowedTools(type, customAgent),
+      includeTask: false,
+      maxTurns: customAgent?.maxTurns ?? (type === "worker" ? 24 : type === "verification" ? 14 : 10),
+    });
+    this.helpers.push(helper);
+    try {
+      const response = await helper.send(runtime.buildHelperMessage(type, requestedPrompt));
+      this.helperCost += response.cost;
+      if (response.subtype !== "success") {
+        runtime.finishHelperRun(
+          helperRun,
+          "failed",
+          response.text || `${type} helper failed with status ${response.subtype}.`,
+        );
+        return undefined;
+      }
+      runtime.finishHelperRun(helperRun, "completed", response.text || `${type} helper completed without text.`);
+      return response.text;
+    } catch (err) {
+      runtime.finishHelperRun(
+        helperRun,
+        "failed",
+        err instanceof Error ? err.message : String(err),
+      );
+      return undefined;
+    } finally {
+      helper.close();
+    }
+  }
 }
+
+function helperModelFor(model: string, type: CodingHelperType): string {
+  if (type === "worker") return model;
+  const normalized = model.includes(":") ? model.split(":").at(-1)! : model;
+  if (/^gpt-/i.test(normalized) || /^o[134]-/i.test(normalized) || /^chatgpt-/i.test(normalized)) {
+    return "gpt-5-mini";
+  }
+  if (/^gemini-|^models\/gemini-/i.test(normalized)) {
+    return "gemini-2.5-flash-lite-preview-09-2025";
+  }
+  if (/^claude-/i.test(normalized)) {
+    return "claude-haiku-4-5-20251001";
+  }
+  return model;
+}
+
+function primaryDisallowedTools(runtime: CodingRuntime): string[] {
+  const disallowed = new Set<string>();
+  if (runtime.state.mode !== "build" && runtime.state.mode !== "coordinate") {
+    for (const name of ["write", "edit", "patch", "bash"]) disallowed.add(name);
+  }
+
+  for (const name of runtime.state.command?.custom?.disallowedTools ?? []) {
+    disallowed.add(name);
+  }
+
+  const allowedTools = runtime.state.command?.custom?.allowedTools;
+  if (allowedTools?.length) {
+    const allowed = new Set(allowedTools.map((toolName) => toolName.toLowerCase()));
+    for (const family of KNOWN_TOOL_FAMILIES) {
+      if (!family.aliases.some((alias) => allowed.has(alias.toLowerCase()))) {
+        for (const alias of family.aliases) disallowed.add(alias);
+      }
+    }
+  }
+
+  return [...disallowed];
+}
+
+function initialPhaseForMode(mode: "build" | "plan" | "review" | "explore" | "coordinate"): "editing" | "reviewing" | "discovering" | "planning" {
+  if (mode === "coordinate") return "planning";
+  if (mode === "build") return "editing";
+  if (mode === "review") return "reviewing";
+  if (mode === "explore") return "discovering";
+  return "planning";
+}
+
+function helperDisallowedTools(
+  type: CodingHelperType,
+  customAgent?: { tools?: string[]; disallowedTools?: string[]; readOnly?: boolean },
+): string[] {
+  if (!customAgent) {
+    if (type === "worker") return [];
+    return type === "verification"
+      ? ["write", "edit", "patch"]
+      : ["write", "edit", "patch", "bash"];
+  }
+
+  const disallowed = new Set<string>(customAgent.disallowedTools ?? []);
+  if (customAgent.readOnly !== false) {
+    for (const name of ["write", "edit", "patch", "bash"]) disallowed.add(name);
+  }
+
+  if (customAgent.tools?.length) {
+    const allowed = new Set(customAgent.tools.map((toolName) => toolName.toLowerCase()));
+    for (const family of KNOWN_TOOL_FAMILIES) {
+      if (!family.aliases.some((alias) => allowed.has(alias.toLowerCase()))) {
+        for (const alias of family.aliases) disallowed.add(alias);
+      }
+    }
+  }
+
+  return [...disallowed];
+}
+
+const KNOWN_TOOL_FAMILIES = [
+  { aliases: ["bash", "Bash", "BashOutput", "KillBash"] },
+  { aliases: ["read", "Read"] },
+  { aliases: ["write", "Write"] },
+  { aliases: ["edit", "Edit", "MultiEdit"] },
+  { aliases: ["patch"] },
+  { aliases: ["grep", "Grep"] },
+  { aliases: ["glob", "Glob"] },
+  { aliases: ["ls", "LS"] },
+  { aliases: ["workspace_status"] },
+  { aliases: ["git_diff"] },
+  { aliases: ["coding_state", "ReadToolResult"] },
+  { aliases: ["webfetch", "WebFetch"] },
+  { aliases: ["LSP", "lsp_status"] },
+  { aliases: ["todowrite", "TodoWrite", "coding_todo"] },
+  { aliases: ["coding_intent"] },
+  { aliases: ["coding_plan_ready", "ExitPlanMode"] },
+  { aliases: ["ToolSearch", "ReadToolResult"] },
+  { aliases: ["Task", "SendMessage", "TaskStop"] },
+  { aliases: ["ScratchpadList", "ScratchpadRead", "ScratchpadWrite"] },
+  { aliases: ["mcp_list_servers", "McpListTools", "McpCallTool", "ListMcpResourcesTool", "ReadMcpResourceTool"] },
+  { aliases: ["servus_done"] },
+  { aliases: ["servus_need_input", "AskUserQuestion"] },
+];

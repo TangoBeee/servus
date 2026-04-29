@@ -8,7 +8,6 @@ import { loadSkills } from "../../skills.js";
 import { loadPlugins } from "../../plugins.js";
 import {
   getDefaultModelForAvailableProvider,
-  hasProviderAccess,
   inferProviderForModel,
   listModelOptions,
 } from "../../provider.js";
@@ -52,7 +51,7 @@ const FIELDS: Array<{ id: Field; label: string; help: string; group: string }> =
   { id: "task", label: "Task", help: "What should Servus do?", group: "Start" },
   { id: "domain", label: "Mode", help: "auto/coding/browser/desktop/media/data/extension/security/general", group: "Start" },
   { id: "model", label: "Model", help: "Choose from available provider models", group: "Provider" },
-  { id: "backend", label: "Backend", help: "auto/custom/claude-code when available", group: "Provider" },
+  { id: "backend", label: "Backend", help: "auto/custom runtime", group: "Provider" },
   { id: "cwd", label: "Folder", help: "Working directory", group: "Context" },
   { id: "budget", label: "Budget", help: "Optional USD cap", group: "Context" },
   { id: "verify", label: "Verify", help: "Optional verification command", group: "Context" },
@@ -314,7 +313,7 @@ export function NewTask({ onSubmit, onBack, onInputLockedChange, inputBlocked = 
   function displayValue(field: Field): string {
     if (field === "task") return task || "(enter task prompt)";
     if (field === "domain") return domainMode;
-    if (field === "backend") return `${backend} -> ${resolveBackend(backend, model)}`;
+    if (field === "backend") return `${formatBackendChoice(backend)} -> ${formatBackendChoice(resolveBackend(backend, model))}`;
     if (field === "model") return model;
     if (field === "cwd") return cwd;
     if (field === "budget") return budget || "(none)";
@@ -348,28 +347,21 @@ function nextChoice<T>(choices: T[], current: T): T {
 }
 
 function availableBackendChoices(model: string): BackendChoice[] {
-  const provider = inferProviderForModel(model);
-  const choices: BackendChoice[] = ["auto", "custom"];
-  if ((provider === "anthropic" || !provider) && hasProviderAccess("anthropic")) {
-    choices.push("claude-code");
-  }
-  return choices;
+  return ["auto", "custom"];
 }
 
 function normalizeBackendChoice(backend: BackendChoice, model: string): BackendChoice {
-  if (backend === "claude-code" && !availableBackendChoices(model).includes("claude-code")) {
-    return "auto";
-  }
   return backend;
 }
 
 function resolveBackend(backend: BackendChoice, model: string): AgentBackend {
   if (backend !== "auto") return backend;
-  const provider = inferProviderForModel(model);
-  if (provider === "anthropic" && hasProviderAccess("anthropic") && !model.includes(":")) {
-    return "claude-code";
-  }
   return "custom";
+}
+
+function formatBackendChoice(backend: BackendChoice | AgentBackend): string {
+  if (backend === "auto") return "auto";
+  return "runtime";
 }
 
 function providerLabel(model: string): string {

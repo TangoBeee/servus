@@ -19,6 +19,7 @@ import { TelemetryTracker } from "./telemetry.js";
 import { AgentRuntime, createRunSession, type RunStatus } from "./runtime.js";
 import { getSession, updateSession } from "./session-store.js";
 import { createRunContract } from "./completion-validator.js";
+import { resolveCodingTargetWorkspace } from "./coding-project.js";
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -166,7 +167,10 @@ export class Orchestrator {
       /\bsame servus session continuation\b/i.test(this.config.task) ||
       /\banswered (?:the )?(?:latest )?(?:clarification|approval)\b/i.test(this.config.task) ||
       /\bfollow-up from user\b/i.test(this.config.task);
-    if (session.status === "running" || session.status === "waiting_input" || isContinuation) {
+    if (session.status === "waiting_input" || isContinuation) {
+      return session.domain;
+    }
+    if (session.status === "running" && session.task !== this.config.task) {
       return session.domain;
     }
     return null;
@@ -177,14 +181,52 @@ export class Orchestrator {
   private async executeWithEngine(engine: Engine, domain: TaskDomain): Promise<OrchestratorRunOutcome> {
     log.phase(`ENGINE: ${engine.name.toUpperCase()}`);
     log.info(`Engine: ${engine.description}`);
+    const workspace = domain === "coding"
+      ? resolveCodingTargetWorkspace(this.config.task, this.config.cwd)
+      : {
+          launchCwd: this.config.cwd,
+          targetCwd: this.config.cwd,
+          reason: "launch_cwd" as const,
+        };
+
+    if (domain === "coding") {
+      log.info(
+        workspace.reason === "explicit_path"
+          ? `Coding target workspace: ${workspace.targetCwd} (from ${workspace.explicitPath})`
+          : `Coding target workspace: ${workspace.targetCwd}`,
+      );
+      if (this.config.sessionId) {
+        updateSession(this.config.sessionId, {
+          cwd: workspace.targetCwd,
+          launchCwd: workspace.launchCwd,
+          targetCwd: workspace.targetCwd,
+        });
+      }
+      bus.push({
+        type: "runtime:state",
+        message: "Coding workspace resolved",
+        metadata: {
+          status: "running",
+          domain,
+          engine: engine.name,
+          launchCwd: workspace.launchCwd,
+          targetCwd: workspace.targetCwd,
+          cwd: workspace.targetCwd,
+          reason: workspace.reason,
+          explicitPath: workspace.explicitPath,
+        },
+      });
+    }
 
     // Initialize proof collector
-    const proof = new ProofCollector(engine.name, this.config.task, this.config.cwd);
+    const proof = new ProofCollector(engine.name, this.config.task, workspace.targetCwd);
     proof.addNote(`Routed to ${engine.name} engine (domain: ${domain})`);
 
     const ctx: EngineContext = {
       task: this.config.task,
-      cwd: this.config.cwd,
+      cwd: workspace.targetCwd,
+      launchCwd: workspace.launchCwd,
+      targetCwd: workspace.targetCwd,
       model: this.config.model,
       backend: this.config.backend,
       maxConsecutiveFailures: this.config.maxConsecutiveFailures,
@@ -195,7 +237,7 @@ export class Orchestrator {
 
     const runSession = createRunSession({
       task: this.config.task,
-      cwd: this.config.cwd,
+      cwd: workspace.targetCwd,
       domain,
       model: this.config.model,
       mode: this.config.backend,
@@ -208,6 +250,9 @@ export class Orchestrator {
       updateSession(this.config.sessionId, {
         phase: "acting",
         contract: runSession.contract,
+        cwd: workspace.targetCwd,
+        launchCwd: workspace.launchCwd,
+        targetCwd: workspace.targetCwd,
       });
     }
 
@@ -243,6 +288,7 @@ export class Orchestrator {
         endTime: Date.now(),
         cost: result.cost,
         proofDir: proof.dir,
+        finalSummary: result.summary,
         artifacts: result.artifacts ?? [],
         evidence: result.evidence ?? [],
       });

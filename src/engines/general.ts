@@ -1,9 +1,10 @@
-import { generateText } from "ai";
-import { resolveModel } from "../provider.js";
-import { log, formatDuration } from "../log.js";
+import { createAgent, type IAgent } from "../agent.js";
+import { log, formatDuration, ANSI } from "../log.js";
 import { bus } from "../events.js";
 import type { Engine, EngineContext, EngineResult } from "../engine.js";
-import { detectClarificationRequest, stripProtocolTags } from "../clarification.js";
+import { SERVUS_OPERATING_LOOP } from "../prompts/operating-loop.js";
+import { runDomainWorkflowRuntime } from "../domain-workflow-runtime.js";
+import { createGeneralTools } from "../tools-general.js";
 
 const GENERAL_PROMPT = `
 # Role: General Assistant
@@ -11,6 +12,8 @@ const GENERAL_PROMPT = `
 You are the **General Assistant** in the Servus agent system.
 Answer general questions, summarize information already provided by the user,
 and help with lightweight reasoning tasks.
+
+${SERVUS_OPERATING_LOOP}
 
 ## Boundaries
 
@@ -24,13 +27,10 @@ and help with lightweight reasoning tasks.
 
 ## Output
 
-When complete, include:
-    <task_status>DONE</task_status>
-
-If a required detail is missing, include:
-    <task_status>NEEDS_INPUT</task_status>
-
-Then ask one clear question.
+When complete, call servus_done with evidence from the user prompt or conversation.
+Use \`general_route_task\` when the request may belong to another domain.
+Use \`general_answer_with_basis\` before finalizing direct answers so the basis is explicit.
+If a required detail is missing, call servus_need_input and ask one clear question.
 `.trim();
 
 export class GeneralEngine implements Engine {
@@ -38,56 +38,63 @@ export class GeneralEngine implements Engine {
   readonly description =
     "Handles non-coding, non-browser, non-desktop, non-media, non-data, non-extension, non-security general questions without mutating files.";
 
+  private agent: IAgent | null = null;
+
   async execute(ctx: EngineContext): Promise<EngineResult> {
     const startTime = Date.now();
 
     try {
       this.emitStatus("working");
-      const resolved = resolveModel(ctx.model);
-      const response = await generateText({
-        model: resolved.model,
-        system: GENERAL_PROMPT,
-        prompt: [
-          "## Task",
+
+      this.agent = await createAgent(ctx.backend, {
+        name: "General",
+        role: "general-assistant",
+        color: ANSI.cyan,
+        model: ctx.model,
+        domain: "general",
+        prompt: GENERAL_PROMPT,
+        extraTools: createGeneralTools() as Record<string, unknown>,
+        disallowedTools: [
+          "bash", "Bash", "BashOutput", "KillBash",
+          "write", "Write", "edit", "Edit", "MultiEdit", "patch",
+          "read", "Read", "grep", "Grep", "glob", "Glob", "ls", "LS",
+          "webfetch", "WebFetch", "McpCallTool",
+        ],
+        sessionId: ctx.sessionId,
+      }, { cwd: ctx.cwd });
+
+      const result = await runDomainWorkflowRuntime({
+        agent: this.agent,
+        ctx,
+        domain: "general",
+        progressRequired: true,
+        plan: [
+          "Decide whether the request is directly answerable.",
+          "Route to a specialized domain when tool-backed evidence is required.",
+          "Answer with explicit basis and limitations.",
+        ],
+        evidenceTypes: ["general: user_supplied_context", "general: routing_decision", "general: answer_basis"],
+        initialMessage: [
+          "## General Task",
           ctx.task,
           "",
-          "Answer directly. If another engine is required, say so clearly.",
+          "Answer directly when the task is genuinely general.",
+          "If another Servus engine is required, say which engine should handle it and why.",
+          "Do not claim file, web, security, code, or automation evidence unless the user supplied it in the prompt.",
         ].join("\n"),
-        temperature: 0,
       });
-      this.emitStatus("done");
-
-      const cleaned = stripProtocolTags(response.text);
-      const clarification = detectClarificationRequest(response.text, ctx.task);
-      const cost = 0;
-      bus.push({
-        type: "cost",
-        agent: "General",
-        message: "cost update",
-        metadata: { cost, provider: resolved.provider, modelId: resolved.modelId },
-      });
-
-      if (clarification) {
+      if (result.needsInput) {
         log.warn("General task is waiting for user input.");
-        return {
-          success: false,
-          needsInput: true,
-          summary: clarification.message,
-          question: clarification.message,
-          questions: clarification.questions,
-          questionContext: clarification.context,
-          clarification,
-          cost,
-          error: "Needs user input",
-        };
+        this.emitStatus("waiting_input");
+        return result;
       }
-
-      log.success("General task completed in " + formatDuration(Date.now() - startTime));
-      return {
-        success: true,
-        summary: cleaned || response.text.trim(),
-        cost,
-      };
+      if (result.success) {
+        this.emitStatus("done");
+        log.success("General task completed in " + formatDuration(Date.now() - startTime));
+        return result;
+      }
+      this.emitStatus("error");
+      return result;
     } catch (err: unknown) {
       this.emitStatus("error");
       return {
@@ -100,10 +107,10 @@ export class GeneralEngine implements Engine {
   }
 
   close(): void {
-    // No persistent local agent resources.
+    this.agent?.close();
   }
 
-  private emitStatus(status: "working" | "done" | "error"): void {
+  private emitStatus(status: "working" | "waiting_input" | "done" | "error"): void {
     bus.push({
       type: "agent:status",
       agent: "General",

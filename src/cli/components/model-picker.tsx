@@ -45,6 +45,7 @@ export function ModelPicker({
                   {option.label}
                 </Text>
                 <Text color={COLORS.muted}>{option.id}</Text>
+                <Text color={COLORS.muted}>{formatPricing(option)}</Text>
                 {option.value === currentModel && <Text color={COLORS.primary}>current</Text>}
                 {option.recommended && <Text color={COLORS.accent}>recommended</Text>}
               </Box>
@@ -68,6 +69,10 @@ export function ModelPicker({
       <Text color={COLORS.muted}>j/k select | Enter choose | c custom | Esc cancel</Text>
     </Box>
   );
+}
+
+function formatPricing(option: ModelOption): string {
+  return `$${option.inputPerM}/$${option.outputPerM}/MTok`;
 }
 
 function groupOptions(options: ModelOption[]): Array<{

@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useState } from "react";
 import { Box, Text } from "ink";
 import { COLORS } from "../theme.js";
 import {
@@ -10,6 +10,8 @@ import {
   MEDIA_TOOLS,
   SECURITY_TOOLS,
   getCapabilityDescriptors,
+  getCapabilityDescriptorsWithLiveMcp,
+  type CapabilityDescriptor,
   type CapabilityStatus,
 } from "../../capabilities.js";
 
@@ -18,7 +20,22 @@ interface Props {
 }
 
 export function CapabilitiesScreen({ cwd = process.cwd() }: Props) {
-  const capabilities = useMemo(() => getCapabilityDescriptors(cwd), [cwd]);
+  const [capabilities, setCapabilities] = useState<CapabilityDescriptor[]>(() => getCapabilityDescriptors(cwd));
+
+  useEffect(() => {
+    let mounted = true;
+    setCapabilities(getCapabilityDescriptors(cwd));
+    getCapabilityDescriptorsWithLiveMcp(cwd)
+      .then((next) => {
+        if (mounted) setCapabilities(next);
+      })
+      .catch(() => {
+        // Keep static descriptors when live MCP health checks fail.
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [cwd]);
   const primary = capabilities.slice(0, 7);
   const secondary = capabilities.slice(7);
 

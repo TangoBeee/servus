@@ -15,6 +15,7 @@ export interface ValidatedAgentTaskOptions {
   domain: TaskDomain;
   initialMessage: string;
   maxRepairAttempts?: number;
+  progressRequired?: boolean;
 }
 
 export async function runValidatedAgentTask(options: ValidatedAgentTaskOptions): Promise<EngineResult> {
@@ -37,6 +38,15 @@ export async function runValidatedAgentTask(options: ValidatedAgentTaskOptions):
   for (let attempt = 0; attempt <= maxRepairAttempts; attempt++) {
     const response = await options.agent.send(message);
     const cost = options.agent.cost;
+    if (options.progressRequired && !hasPublicProgressNote(response) && attempt < maxRepairAttempts) {
+      message = [
+        "## Public progress note missing",
+        "Before continuing, call servus_progress or ReportProgress with a concise public working note.",
+        "Explain what you checked, what evidence you still need, and what you will do next.",
+        "Do not reveal private chain-of-thought.",
+      ].join("\n");
+      continue;
+    }
 
     const finalization = getFinalization(response);
     if (finalization?.kind === "need_input") {
@@ -117,6 +127,13 @@ export async function runValidatedAgentTask(options: ValidatedAgentTaskOptions):
     cost: options.agent.cost,
     error: "Runtime repair limit exceeded",
   };
+}
+
+function hasPublicProgressNote(response: AgentResponse): boolean {
+  return (response.toolEvents ?? []).some((event) =>
+    event.type === "call" &&
+    (event.toolName === "servus_progress" || event.toolName === "ReportProgress")
+  );
 }
 
 export function resultFromValidatedResponse(

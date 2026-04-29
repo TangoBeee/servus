@@ -3,9 +3,8 @@ import { log, ANSI, formatDuration } from "../log.js";
 import { bus } from "../events.js";
 import { createSecurityTools } from "../tools-security.js";
 import type { Engine, EngineContext, EngineResult } from "../engine.js";
-import { detectClarificationRequest, stripProtocolTags } from "../clarification.js";
 import { SERVUS_OPERATING_LOOP } from "../prompts/operating-loop.js";
-import { resultFromValidatedResponse } from "../agentic-loop.js";
+import { runDomainAgentRuntime } from "../domain-agent-runtime.js";
 
 const SECURITY_PROMPT = `
 # Role: Cyber Security Agent
@@ -69,6 +68,25 @@ Run Offensive first, then Defensive. For every vulnerability found:
 ## Tools
 
 - security_readiness: describe available safe security capabilities.
+- security_preflight: validate scope, local repo, focus/avoid rules, selected classes, and safe validation mode before deeper work.
+- security_pipeline_plan: create a safe pipeline: pre-recon, recon, class analysis, validation verdicts, and reporting.
+- security_scan_mode_plan: choose quick/standard/deep security coverage, lanes, stop rules, and required evidence.
+- security_context_playbook: select framework/protocol/cloud/technology-specific review guidance.
+- security_pre_recon_code_map: inspect local source for routes, auth flows, sinks, controls, and class hotspots.
+- security_vulnerability_class_plan: get class-specific methodology, queue fields, false-positive checks, safe validation, remediation, and detection.
+- security_create_validation_queue: normalize candidate vulnerabilities into an evidence queue with safe validation requirements.
+- security_exploitation_decision: decide whether candidates are ready for safe validation or must remain static/follow-up items.
+- security_classify_validation_result: classify validation evidence as EXPLOITED, BLOCKED_BY_SECURITY, OUT_OF_SCOPE_INTERNAL, FALSE_POSITIVE, POTENTIAL, or NOT_TESTED.
+- security_report_filter: filter findings by severity, confidence, and verdict before writing a report.
+- security_http_request: send a bounded explicit-scope HTTP request; state-changing methods require approval.
+- security_request_history / security_repeat_request: review and safely replay bounded requests from this Servus security process.
+- security_extract_endpoints: extract endpoints, forms, parameters, JavaScript routes, URLs, and headers from a URL/path/text.
+- security_cors_audit: check CORS headers and origin reflection for one URL.
+- security_cookie_audit: check Set-Cookie security attributes from a URL or raw header.
+- security_external_tool_readiness: check local availability of common security CLIs without running scans.
+- security_run_cli_tool: run allowlisted external security CLIs with exact-scope validation, blocked dangerous flags, consent, timeout, and output limits.
+- security_cvss_score: calculate CVSS v3.1 base score/severity.
+- security_create_finding: build a complete report-ready finding object with evidence, attack, impact, remediation, prevention, and detection.
 - security_scope_check: verify an explicit target.
 - security_http_probe: fetch one explicit URL safely.
 - security_header_audit: check common web security headers.
@@ -85,6 +103,12 @@ Run Offensive first, then Defensive. For every vulnerability found:
 
 ## Playbook Discipline
 
+Run security_preflight and security_scan_mode_plan early for any non-trivial
+security task. If source code is in scope, run security_pre_recon_code_map
+before claiming app architecture, routes, auth boundaries, data stores, or sink
+paths. If the stack mentions a framework, protocol, cloud, container, or backend
+platform, call security_context_playbook and apply the selected evidence list.
+
 Use focused playbooks before class-specific analysis. If the task mentions JWT,
 GraphQL, file uploads, IDOR/access control, XSS, injection, SSRF, race/business
 logic, or AI-agent security, call security_playbook first and use its checklist
@@ -95,15 +119,37 @@ evasion steps, persistence, credential theft, malware, or exfiltration instructi
 For each checklist item, track whether it is confirmed, not found, or needs more
 scope. Tie every finding to evidence, impact, remediation, and detection.
 
+External CLI tools are optional evidence collectors, not the main reasoning
+system. Check security_external_tool_readiness first, then use
+security_run_cli_tool only when built-in tools are insufficient, the exact target
+is authorized, and the action is approved. Treat scanner output as candidate
+evidence and still classify findings with security_classify_validation_result.
+
+## Validation Verdict Discipline
+
+Use the following verdicts for every candidate:
+- EXPLOITED: safe validation proves attacker-controlled input reaches a security impact in authorized scope.
+- BLOCKED_BY_SECURITY: the candidate was tested or traced and a control blocked exploitation.
+- OUT_OF_SCOPE_INTERNAL: validation would require touching internal or third-party systems outside explicit scope.
+- FALSE_POSITIVE: code/config evidence proves the candidate is guarded, sanitized, parameterized, or unreachable.
+- POTENTIAL: plausible but not proven; include as follow-up only, not as a confirmed finding.
+- NOT_TESTED: required credentials, sandbox, target, or scope were missing.
+
+Do not turn POTENTIAL or NOT_TESTED items into confirmed findings. If you create
+a report, filter findings first and clearly separate confirmed findings,
+blocked controls, hypotheses, and limitations.
+
 ## Workflow
 
-1. Target Understanding: identify app/API/local repo/system type and scope.
-2. Reconnaissance: enumerate only safe, explicit URLs/files/endpoints provided or discovered from the target response.
-3. Vulnerability Analysis: reason about OWASP Top 10, authz/authn, IDOR, injection, XSS, misconfig, sensitive exposure.
-4. Exploit Validation: use non-destructive evidence. Do not submit harmful payloads.
-5. Attack Chain Reasoning: combine findings into realistic but safe escalation paths.
-6. Remediation: provide developer-friendly fixes and config/code guidance.
-7. Reporting: produce a professional structured report.
+1. Preflight: validate explicit target, local repo, focus/avoid rules, selected vulnerability classes, and safe validation mode.
+2. Scan Mode: choose quick, standard, or deep coverage and state what will be intentionally skipped.
+3. Target Understanding: identify app/API/local repo/system type, framework/protocol/cloud context, auth assumptions, and scope.
+4. Pre-Recon And Reconnaissance: enumerate only safe explicit URLs/files/endpoints, source routes, auth flows, inputs, data stores, and controls.
+5. Vulnerability Analysis: run class/context-specific methods for injection, XSS, auth, authz, SSRF, protocol/cloud risks, and any requested playbooks.
+6. Validation Queue: normalize candidates, decide whether safe validation is allowed, perform safe non-destructive checks, and classify each with a verdict.
+7. Attack Chain Reasoning: combine only evidence-backed findings into realistic but safe escalation paths.
+8. Remediation: provide developer-friendly fixes, prevention, monitoring, and detection for every finding.
+9. Reporting: produce a professional structured report with confirmed findings and limitations.
 
 ## Enhanced Output Format
 
@@ -142,6 +188,7 @@ export class SecurityEngine implements Engine {
         role: "cyber-security",
         color: ANSI.magenta,
         model: ctx.model,
+        domain: "security",
         prompt: SECURITY_PROMPT,
         extraTools: createSecurityTools(ctx) as Record<string, unknown>,
         disallowedTools: ["bash", "write", "edit", "patch", "webfetch"],
@@ -157,7 +204,12 @@ export class SecurityEngine implements Engine {
       });
       this.emitStatus("working");
 
-      const response = await this.agent.send([
+      const result = await runDomainAgentRuntime({
+        agent: this.agent,
+        ctx,
+        domain: "security",
+        progressRequired: true,
+        initialMessage: [
         "## Security Task",
         ctx.task,
         "",
@@ -170,53 +222,28 @@ export class SecurityEngine implements Engine {
         "`" + ctx.cwd + "`",
         "",
         "Perform only safe, authorized, explicit-scope testing.",
+        "For non-trivial tasks, start with security_preflight and security_pipeline_plan.",
+        "Choose quick/standard/deep coverage with security_scan_mode_plan and use security_context_playbook for detected stacks.",
+        "If source code is in scope, use security_pre_recon_code_map before drawing architecture or vulnerability conclusions.",
+        "Classify every candidate with explicit validation verdicts before reporting it as confirmed.",
         "Call servus_done with scope, findings, and safe evidence when finished.",
         "If the target/scope is missing or ambiguous, call servus_need_input and ask one question.",
-      ].join("\n"));
-
-      const cost = this.agent.cost;
+      ].join("\n"),
+      });
       const elapsed = Date.now() - startTime;
-      const clarification = detectClarificationRequest(response.text, ctx.task);
-      const cleaned = stripProtocolTags(response.text);
-      const finalized = resultFromValidatedResponse(ctx, "security", response);
-      if (finalized) {
-        this.emitStatus(finalized.needsInput ? "waiting_input" : finalized.success ? "done" : "error");
-        return finalized;
-      }
-
-      if (clarification) {
+      if (result.needsInput) {
         log.warn("Security task is waiting for user input.");
         this.emitStatus("waiting_input");
-        return {
-          success: false,
-          needsInput: true,
-          summary: clarification.message,
-          question: clarification.message,
-          questions: clarification.questions,
-          questionContext: clarification.context,
-          clarification,
-          cost,
-          error: "Needs user input",
-        };
+        return result;
       }
-
-      if (response.text.includes("<task_status>DONE</task_status>")) {
+      if (result.success) {
         this.emitStatus("done");
         log.success("Security task completed in " + formatDuration(elapsed));
-        return {
-          success: true,
-          summary: cleaned,
-          cost,
-        };
+        return result;
       }
 
       this.emitStatus("error");
-      return {
-        success: false,
-        summary: "Security agent did not complete the task within the allowed turns.",
-        cost,
-        error: "Agent did not signal DONE",
-      };
+      return result;
     } catch (err) {
       this.emitStatus("error");
       return {
@@ -245,6 +272,7 @@ type SecurityMode = "Offensive" | "Defensive" | "Hybrid";
 
 function inferSecurityMode(task: string): SecurityMode {
   const text = task.toLowerCase();
+  if (/\b(audit|assessment|assess|review|pentest report|security report)\b/.test(text)) return "Hybrid";
   const offensive =
     /\b(find|test|attack|attacker|red\s*team|pentest|penetration|exploit|validate|bypass|enumerate|recon|surface|vulnerabilit|owasp|xss|sqli|idor|csrf)\b/.test(text);
   const defensive =

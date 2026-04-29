@@ -4,6 +4,7 @@
   "author": "tangobee",
   "description": "Local-first multi-capability AI operator with proof-backed execution",
   "type": "module",
+  "homepage": "https://servus.tangobee.dev",
   "bin": {
     "servus": "./dist/index.js"
   },
@@ -13,11 +14,14 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
-    "start": "tsx src/index.ts",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc",
+    "start": "node --import tsx src/index.ts",
     "dev": "tsx --watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "npm run build",
+    "test:coding-runtime": "npm run build && node scripts/coding-runtime-smoke.mjs",
+    "test:browser-runtime": "npm run build && SERVUS_BROWSER_HEADLESS=1 node scripts/browser-runtime-smoke.mjs",
     "prepublishOnly": "npm run build"
   },
   "repository": {
@@ -31,10 +35,9 @@
     "@ai-sdk/anthropic": "^3.0.64",
     "@ai-sdk/google": "^3.0.53",
     "@ai-sdk/openai": "^3.0.48",
-    "@anthropic-ai/claude-agent-sdk": "^0.2.76",
-    "@anthropic-ai/sdk": "^0.80.0",
     "@google/genai": "^1.46.0",
     "@inkjs/ui": "^2.0.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@playwright/test": "^1.58.2",
     "ai": "^6.0.116",
     "csv-parse": "^6.2.1",

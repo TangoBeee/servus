@@ -1,14 +1,16 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
-import { tool } from "ai";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { generateObject, tool } from "ai";
 import type { ToolResultOutput } from "@ai-sdk/provider-utils";
 import { z } from "zod";
 import { log } from "./log.js";
 import { bus } from "./events.js";
 import { assessRisk, requestConsent } from "./consent.js";
 import { loadConfig } from "./config.js";
+import { resolveModel } from "./provider.js";
 import {
+  browserSessionDir,
   browserScreenshotsDir,
   browserUserDataDir,
   loadBrowserSessionState,
@@ -27,6 +29,7 @@ const MAX_EXTRACT_CHARS = 50_000;
 const MAX_SNAPSHOT_ELEMENTS = 120;
 const SNAPSHOT_LINE_CHARS = 180;
 const RECENT_ACTION_LIMIT = 16;
+const MAX_ACTION_CACHE_ENTRIES = 200;
 
 type BrowserMethod =
   | "click"
@@ -39,6 +42,11 @@ type BrowserMethod =
   | "scroll"
   | "back"
   | "wait";
+
+type BrowserActMethod =
+  | BrowserMethod
+  | "drag"
+  | "upload";
 
 interface LocatorQuery {
   selector: string;
@@ -77,7 +85,16 @@ interface SnapshotResult {
   timestamp: number;
   path: string;
   elements: SnapshotElement[];
+  activeSurface?: ActiveSurfaceInfo;
   blockedReason?: string;
+}
+
+interface ActiveSurfaceInfo {
+  selector: string;
+  text: string;
+  bounds?: { x: number; y: number; width: number; height: number };
+  zIndex?: number;
+  reason: string;
 }
 
 interface TextMatchCandidate {
@@ -112,6 +129,22 @@ interface BrowserRuntime {
     after: string;
   }>;
   proofScreenshots: string[];
+}
+
+interface CachedBrowserAction {
+  id: string;
+  instructionKey: string;
+  urlKey: string;
+  createdAt: number;
+  lastUsedAt?: number;
+  hits: number;
+  method: BrowserMethod;
+  locatorQuery: LocatorQuery;
+  selector: string;
+  name: string;
+  text?: string;
+  value?: string;
+  key?: string;
 }
 
 interface ActionOutcome {
@@ -411,6 +444,122 @@ async function detectBlockPage(page: Page): Promise<string | undefined> {
   return undefined;
 }
 
+async function detectActiveSurfaceInfo(page: Page): Promise<ActiveSurfaceInfo | undefined> {
+  return page.evaluate(() => {
+    const clean = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const cssPath = (node: Element) => {
+      if (node.id) return `#${CSS.escape(node.id)}`;
+      const parts: string[] = [];
+      let current: Element | null = node;
+      while (current && current !== document.documentElement && parts.length < 8) {
+        const parent: Element | null = current.parentElement;
+        const tag = current.tagName.toLowerCase();
+        if (!parent) {
+          parts.unshift(tag);
+          break;
+        }
+        const siblings = (Array.from(parent.children) as Element[]).filter((child) => child.tagName === current!.tagName);
+        const index = siblings.indexOf(current) + 1;
+        parts.unshift(`${tag}:nth-of-type(${Math.max(index, 1)})`);
+        current = parent;
+      }
+      return parts.join(" > ");
+    };
+    const alpha = (value: string) => {
+      const match = value.match(/rgba?\(([^)]+)\)/i);
+      if (!match) return value && value !== "transparent" ? 1 : 0;
+      const parts = match[1].split(",").map((part) => part.trim());
+      if (parts.length < 4) return 1;
+      const parsed = Number(parts[3]);
+      return Number.isFinite(parsed) ? parsed : 1;
+    };
+    const isVisible = (el: Element, rect = el.getBoundingClientRect()) => {
+      const style = window.getComputedStyle(el);
+      return rect.width > 8 && rect.height > 8 && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0;
+    };
+    const topMostScore = (el: Element, rect: DOMRect) => {
+      const points = [
+        [rect.left + rect.width / 2, rect.top + rect.height / 2],
+        [rect.left + Math.min(rect.width - 2, 16), rect.top + Math.min(rect.height - 2, 16)],
+        [rect.right - Math.min(rect.width - 2, 16), rect.bottom - Math.min(rect.height - 2, 16)],
+      ];
+      return points.reduce((score, [rawX, rawY]) => {
+        const x = Math.min(Math.max(rawX, 0), Math.max(window.innerWidth - 1, 0));
+        const y = Math.min(Math.max(rawY, 0), Math.max(window.innerHeight - 1, 0));
+        const hit = document.elementFromPoint(x, y);
+        return score + (hit && (hit === el || el.contains(hit) || hit.contains(el)) ? 1 : 0);
+      }, 0);
+    };
+
+    const explicitSelector = [
+      "dialog[open]",
+      "[aria-modal='true']",
+      "[role='dialog']",
+      "[role='alertdialog']",
+      "[role='listbox']",
+      "[role='menu']",
+      "[popover]",
+      "[class*='modal' i]",
+      "[class*='popup' i]",
+      "[class*='popover' i]",
+      "[class*='drawer' i]",
+      "[class*='dropdown' i]",
+      "[class*='listbox' i]",
+      "[class*='suggest' i]",
+      "[class*='autocomplete' i]",
+    ].join(",");
+
+    const viewportArea = Math.max(window.innerWidth * window.innerHeight, 1);
+    let best: { el: Element; score: number; reason: string } | undefined;
+    const candidates = Array.from(document.querySelectorAll("body *"));
+    for (const el of candidates) {
+      const rect = el.getBoundingClientRect();
+      if (!isVisible(el, rect)) continue;
+      const text = clean(el.textContent).slice(0, 1600);
+      if (!text) continue;
+      const style = window.getComputedStyle(el);
+      const area = rect.width * rect.height;
+      if (area < viewportArea * 0.01 || area > viewportArea * 0.9) continue;
+      const z = Number.parseInt(style.zIndex || "0", 10);
+      const topScore = topMostScore(el, rect);
+      const explicit = el.matches(explicitSelector);
+      const elevated = explicit || style.position === "fixed" || style.position === "absolute" || (Number.isFinite(z) && z > 1) || style.boxShadow !== "none" || alpha(style.backgroundColor) > 0.74;
+      const centered = rect.left + rect.width / 2 > window.innerWidth * 0.05 &&
+        rect.left + rect.width / 2 < window.innerWidth * 0.95 &&
+        rect.top + rect.height / 2 > window.innerHeight * 0.05 &&
+        rect.top + rect.height / 2 < window.innerHeight * 0.95;
+      if (!centered || !elevated) continue;
+
+      const score =
+        (explicit ? 160 : 0) +
+        topScore * 70 +
+        (style.position === "fixed" ? 60 : 0) +
+        (style.boxShadow !== "none" ? 24 : 0) +
+        (Number.isFinite(z) ? Math.min(z, 120) : 0) +
+        Math.min(area / viewportArea * 60, 60);
+      if (!best || score > best.score) {
+        best = { el, score, reason: explicit ? "explicit modal/dropdown surface" : "visual top-layer surface" };
+      }
+    }
+    if (!best) return undefined;
+    const rect = best.el.getBoundingClientRect();
+    const style = window.getComputedStyle(best.el);
+    const parsedZ = Number.parseInt(style.zIndex || "0", 10);
+    return {
+      selector: cssPath(best.el),
+      text: clean(best.el.textContent).slice(0, 800),
+      bounds: {
+        x: Math.round(rect.x),
+        y: Math.round(rect.y),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      },
+      zIndex: Number.isFinite(parsedZ) ? parsedZ : undefined,
+      reason: best.reason,
+    };
+  });
+}
+
 async function captureSnapshot(
   runtime: BrowserRuntime,
   instruction?: string,
@@ -452,12 +601,14 @@ async function captureSnapshot(
   runtime.legacyIds = new Map(elements.map((element) => [element.legacyId, element.ref]));
 
   const title = await runtime.page.title().catch(() => "");
+  const activeSurface = await detectActiveSurfaceInfo(runtime.page).catch(() => undefined);
   const snapshot: SnapshotResult = {
     url: runtime.page.url(),
     title,
     timestamp: Date.now(),
     path: "",
     elements,
+    ...(activeSurface ? { activeSurface } : {}),
     ...(blockedReason ? { blockedReason } : {}),
   };
   const path = writeBrowserSnapshot(runtime.sessionId, {
@@ -499,6 +650,19 @@ async function collectFrameElements(
     Math.max(30, Math.min(80, maxElements)),
   ).catch(() => []);
   for (const candidate of textMatches) {
+    if (elements.length >= maxElements) return;
+    const item = snapshotElementFromTextCandidate(frame, candidate, elements.length + 1);
+    const key = elementDedupeKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    elements.push(item);
+  }
+
+  const hitTestElements = await collectHitTestElements(
+    frame,
+    Math.max(30, Math.min(100, maxElements)),
+  ).catch(() => []);
+  for (const candidate of hitTestElements) {
     if (elements.length >= maxElements) return;
     const item = snapshotElementFromTextCandidate(frame, candidate, elements.length + 1);
     const key = elementDedupeKey(item);
@@ -663,7 +827,7 @@ async function collectTopLayerElements(
           style.boxShadow !== "none" ||
           Number.parseFloat(style.borderRadius || "0") > 6 ||
           bgAlpha > 0.72;
-        if (!centered || (!elevated && !dimBackdrop && !topMost)) return null;
+        if (!centered || (!elevated && !dimBackdrop)) return null;
         const score =
           (explicit ? 80 : 0) +
           (topMost ? 60 : 0) +
@@ -1010,6 +1174,162 @@ async function collectTextMatchElements(
   }, { ...hints, limit });
 }
 
+async function collectHitTestElements(
+  frame: Frame,
+  limit: number,
+): Promise<TextMatchCandidate[]> {
+  return frame.evaluate(({ limit }) => {
+    const clean = (value: string | null | undefined) => (value ?? "").replace(/\s+/g, " ").trim();
+    const cssPath = (node: Element) => {
+      if (node.id) return `#${CSS.escape(node.id)}`;
+      const parts: string[] = [];
+      let current: Element | null = node;
+      while (current && current !== document.documentElement && parts.length < 8) {
+        const parent: Element | null = current.parentElement;
+        const tag = current.tagName.toLowerCase();
+        if (!parent) {
+          parts.unshift(tag);
+          break;
+        }
+        const siblings = (Array.from(parent.children) as Element[]).filter((child) => child.tagName === current!.tagName);
+        const index = siblings.indexOf(current) + 1;
+        parts.unshift(`${tag}:nth-of-type(${Math.max(index, 1)})`);
+        current = parent;
+      }
+      return parts.join(" > ");
+    };
+    const isVisible = (el: Element, rect = el.getBoundingClientRect()) => {
+      const style = window.getComputedStyle(el);
+      return rect.width >= 4 && rect.height >= 4 && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0;
+    };
+    const popupSelector = [
+      "dialog",
+      "[aria-modal='true']",
+      "[role='dialog']",
+      "[role='alertdialog']",
+      "[role='listbox']",
+      "[role='menu']",
+      "[role='tree']",
+      "[role='grid']",
+      "[popover]",
+      "[class*='modal' i]",
+      "[class*='popup' i]",
+      "[class*='overlay' i]",
+      "[class*='drawer' i]",
+      "[class*='dropdown' i]",
+      "[class*='listbox' i]",
+      "[class*='suggest' i]",
+      "[class*='autocomplete' i]",
+    ].join(",");
+    const roleFor = (el: Element) => {
+      const explicit = el.getAttribute("role") || "";
+      if (explicit) return explicit;
+      const tag = el.tagName.toLowerCase();
+      const type = el.getAttribute("type") || "";
+      if (tag === "button") return "button";
+      if (tag === "a") return "link";
+      if (tag === "select") return "select";
+      if (tag === "textarea") return "textbox";
+      if (tag === "input") return type === "checkbox" ? "checkbox" : type === "radio" ? "radio" : type === "submit" || type === "button" ? "button" : "textbox";
+      if (el.hasAttribute("aria-haspopup") || el.hasAttribute("aria-expanded")) return "button";
+      return "";
+    };
+    const isScrollable = (node: Element) => {
+      const style = window.getComputedStyle(node);
+      const overflow = `${style.overflow} ${style.overflowX} ${style.overflowY}`;
+      return /(auto|scroll|overlay)/i.test(overflow) && (node.scrollHeight > node.clientHeight + 2 || node.scrollWidth > node.clientWidth + 2);
+    };
+    const directText = (el: Element) => {
+      const own = Array.from(el.childNodes)
+        .filter((node) => node.nodeType === Node.TEXT_NODE)
+        .map((node) => node.textContent || "")
+        .join(" ");
+      return clean(own) || clean(el.getAttribute("aria-label")) || clean(el.getAttribute("title")) || clean(el.textContent);
+    };
+
+    const points: Array<[number, number]> = [];
+    const columns = 9;
+    const rows = 7;
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < columns; x++) {
+        points.push([
+          Math.round((window.innerWidth * (x + 0.5)) / columns),
+          Math.round((window.innerHeight * (y + 0.5)) / rows),
+        ]);
+      }
+    }
+
+    const seen = new Set<Element>();
+    const scored: Array<{ score: number; candidate: TextMatchCandidate }> = [];
+    for (const [x, y] of points) {
+      for (const raw of document.elementsFromPoint(x, y)) {
+        let el: Element | null = raw;
+        for (let depth = 0; el && depth < 4; depth++, el = el.parentElement) {
+          if (seen.has(el)) continue;
+          seen.add(el);
+          const rect = el.getBoundingClientRect();
+          if (!isVisible(el, rect)) continue;
+          const style = window.getComputedStyle(el);
+          const text = directText(el);
+          const label = clean(el.getAttribute("aria-label")) || clean(el.getAttribute("title"));
+          const placeholder = clean(el.getAttribute("placeholder"));
+          const href = clean(el.getAttribute("href"));
+          const value = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement ? el.value : "";
+          const name = clean([label, text, placeholder, value, href].join(" "));
+          if (!name || name.length > 260) continue;
+          const role = roleFor(el);
+          const clickable = el.matches("button,a,input,textarea,select,[role],[onclick],[tabindex],[aria-haspopup],[aria-expanded]") || style.cursor === "pointer";
+          const popup = el.closest(popupSelector);
+          if (!clickable && !popup && el.children.length > 0) continue;
+          let scrollable: Element | null = null;
+          for (let current: Element | null = el; current; current = current.parentElement) {
+            if (isScrollable(current)) {
+              scrollable = current;
+              break;
+            }
+            if (current === document.body) break;
+          }
+          const parsedZ = Number.parseInt(style.zIndex || "0", 10);
+          const score =
+            (clickable ? 40 : 12) +
+            (popup ? 24 : 0) +
+            (style.cursor === "pointer" ? 14 : 0) +
+            (role ? 10 : 0) +
+            (Number.isFinite(parsedZ) ? Math.min(parsedZ, 30) : 0) +
+            Math.max(0, 160 - name.length) / 12;
+          scored.push({
+            score,
+            candidate: {
+              tag: el.tagName.toLowerCase(),
+              role,
+              type: el.getAttribute("type") || "",
+              text,
+              label,
+              placeholder,
+              href,
+              selector: cssPath(el),
+              visible: true,
+              enabled: !(el instanceof HTMLButtonElement || el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) || !el.disabled,
+              bounds: {
+                x: Math.round(rect.x),
+                y: Math.round(rect.y),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+              },
+              ...(value ? { value } : {}),
+              ...(popup ? { inModal: true, activePopup: true } : {}),
+              topMost: true,
+              ...(Number.isFinite(parsedZ) && parsedZ ? { zIndex: parsedZ } : {}),
+              ...(scrollable ? { scrollableSelector: cssPath(scrollable) } : {}),
+            },
+          });
+        }
+      }
+    }
+    return scored.sort((a, b) => b.score - a.score).slice(0, limit).map((item) => item.candidate);
+  }, { limit });
+}
+
 function snapshotElementFromTextCandidate(
   frame: Frame,
   candidate: TextMatchCandidate,
@@ -1276,6 +1596,9 @@ function snapshotToText(snapshot: SnapshotResult, legacy = false): string {
     `Title: ${snapshot.title}`,
     `Snapshot: ${snapshot.path}`,
     snapshot.blockedReason ? `Blocked: ${snapshot.blockedReason}` : "",
+    snapshot.activeSurface
+      ? `Active surface: ${snapshot.activeSurface.reason} ${snapshot.activeSurface.bounds ? `at=${Math.round(snapshot.activeSurface.bounds.x + snapshot.activeSurface.bounds.width / 2)},${Math.round(snapshot.activeSurface.bounds.y + snapshot.activeSurface.bounds.height / 2)} size=${snapshot.activeSurface.bounds.width}x${snapshot.activeSurface.bounds.height}` : ""} selector=${snapshot.activeSurface.selector}`
+      : "",
   ].filter(Boolean).join("\n");
 
   if (snapshot.elements.length === 0) {
@@ -2277,6 +2600,132 @@ async function runRefActionWithSelfHeal(
   }
 }
 
+async function dragBetweenRefs(
+  ctx: EngineContext,
+  runtime: BrowserRuntime,
+  source: SnapshotElement,
+  target: SnapshotElement,
+  instruction?: string,
+): Promise<ActionOutcome> {
+  const blocked = await guardRisk(
+    ctx,
+    "browser_drag_ref",
+    `Drag ${source.ref} to ${target.ref}${instruction ? `\nInstruction: ${instruction}` : ""}`,
+  );
+  if (blocked) {
+    return {
+      success: false,
+      content: blocked,
+      method: "click",
+      ref: source.ref,
+      selector: source.selector,
+      attempt: 1,
+    };
+  }
+  const before = await browserStateKey(runtime.page);
+  const sourceLocator = resolveLocator(runtime, source);
+  const targetLocator = resolveLocator(runtime, target);
+  await scrollElementForAction(runtime, source, sourceLocator);
+  await scrollElementForAction(runtime, target, targetLocator);
+  await sourceLocator.dragTo(targetLocator, { timeout: 12_000 });
+  await settlePage(runtime.page);
+  await savePageState(runtime, "open");
+  const after = await browserStateKey(runtime.page);
+  const success = before !== after;
+  const screenshot = await captureViewportScreenshot(runtime, "drag-ref").catch(() => undefined);
+  const title = await runtime.page.title().catch(() => "");
+  recordBrowserAction(runtime.sessionId, {
+    timestamp: Date.now(),
+    tool: "browser_drag_ref",
+    method: "drag",
+    instruction,
+    ref: source.ref,
+    selector: `${source.selector} -> ${target.selector}`,
+    url: runtime.page.url(),
+    title,
+    success,
+  });
+  return {
+    success,
+    content: success
+      ? "Drag action completed and page state changed."
+      : "Drag action completed, but no page or visual state change was detected.",
+    method: "click",
+    ref: source.ref,
+    selector: `${source.selector} -> ${target.selector}`,
+    attempt: 1,
+    visualChanged: success,
+    ...(screenshot ? { screenshot } : {}),
+  };
+}
+
+async function uploadFileToRef(
+  ctx: EngineContext,
+  runtime: BrowserRuntime,
+  element: SnapshotElement,
+  filePath: string,
+  instruction?: string,
+): Promise<ActionOutcome> {
+  const targetPath = isAbsolute(filePath) ? filePath : resolve(ctx.cwd, filePath);
+  const blocked = await guardRisk(
+    ctx,
+    "browser_upload_ref",
+    `Upload local file ${targetPath} to ${element.ref}${instruction ? `\nInstruction: ${instruction}` : ""}`,
+  );
+  if (blocked) {
+    return {
+      success: false,
+      content: blocked,
+      method: "click",
+      ref: element.ref,
+      selector: element.selector,
+      attempt: 1,
+    };
+  }
+  if (!existsSync(targetPath)) {
+    return {
+      success: false,
+      content: `Upload file does not exist: ${targetPath}`,
+      method: "click",
+      ref: element.ref,
+      selector: element.selector,
+      attempt: 1,
+    };
+  }
+  const before = await browserStateKey(runtime.page);
+  const locator = resolveLocator(runtime, element);
+  await locator.setInputFiles(targetPath, { timeout: 12_000 });
+  await settlePage(runtime.page);
+  await savePageState(runtime, "open");
+  const after = await browserStateKey(runtime.page);
+  const success = before !== after || element.tag === "input";
+  const screenshot = await captureViewportScreenshot(runtime, "upload-ref").catch(() => undefined);
+  const title = await runtime.page.title().catch(() => "");
+  recordBrowserAction(runtime.sessionId, {
+    timestamp: Date.now(),
+    tool: "browser_upload_ref",
+    method: "upload",
+    instruction,
+    ref: element.ref,
+    selector: element.selector,
+    url: runtime.page.url(),
+    title,
+    success,
+  });
+  return {
+    success,
+    content: success
+      ? `Uploaded ${basename(targetPath)}.`
+      : `Tried to upload ${basename(targetPath)}, but no state change was detected.`,
+    method: "click",
+    ref: element.ref,
+    selector: element.selector,
+    attempt: 1,
+    visualChanged: success,
+    ...(screenshot ? { screenshot } : {}),
+  };
+}
+
 function findSimilarElement(elements: SnapshotElement[], target: SnapshotElement): SnapshotElement | undefined {
   const targetName = normalizeWords(`${target.label} ${target.text} ${target.placeholder} ${target.href}`);
   let best: { element: SnapshotElement; score: number } | undefined;
@@ -2329,6 +2778,355 @@ function chooseAction(
     element: best.element,
     ...(text ? { text } : {}),
     ...(selectValue ? { value: selectValue } : {}),
+  };
+}
+
+const modelActionDecisionSchema = z.object({
+  method: z.enum(["click", "double_click", "fill", "type", "press", "select", "hover", "scroll", "back", "wait", "drag", "upload"]),
+  ref: z.string().optional().describe("A ref from the supplied snapshot. Required for element actions."),
+  targetRef: z.string().optional().describe("Second ref for drag/drop actions."),
+  text: z.string().optional().describe("Text to fill or type."),
+  value: z.string().optional().describe("Option value/label to select or file path for upload."),
+  key: z.string().optional().describe("Keyboard key for press."),
+  twoStep: z.boolean().optional().describe("True when this action opens a popup/dropdown/search menu and needs a fresh snapshot after the first step."),
+  confidence: z.enum(["low", "medium", "high"]),
+  reason: z.string(),
+});
+
+type ModelActionDecision = z.infer<typeof modelActionDecisionSchema>;
+
+async function chooseActionWithModel(
+  ctx: EngineContext,
+  snapshot: SnapshotResult,
+  instruction: string,
+  value?: string,
+): Promise<{ method: BrowserActMethod; element?: SnapshotElement; target?: SnapshotElement; text?: string; value?: string; key?: string; twoStep?: boolean; reason?: string; source: "model" | "heuristic"; error?: string }> {
+  const heuristic = chooseAction(snapshot.elements, instruction, value);
+  if (snapshot.elements.length === 0) {
+    return { ...heuristic, source: "heuristic" };
+  }
+
+  try {
+    const resolved = resolveModel(ctx.model);
+    const compactSnapshot = snapshotToText({
+      ...snapshot,
+      elements: snapshot.elements.slice(0, Math.min(snapshot.elements.length, 90)),
+    });
+    const response = await generateObject({
+      model: resolved.model,
+      schema: modelActionDecisionSchema,
+      temperature: 0,
+      prompt: [
+        "You are Servus Browser Act selector. Pick exactly one browser action from the supplied snapshot.",
+        "Use only refs that appear in the snapshot. Prefer active popup/modal/listbox refs over background refs.",
+        "For dropdowns/search/autocomplete, choose the control first and set twoStep=true if the visible option is not already present.",
+        "If the option is already visible, choose the option ref directly with method=click or select.",
+        "Do not guess a ref when confidence is low.",
+        "",
+        `Instruction: ${instruction}`,
+        value ? `Explicit value: ${value}` : "",
+        "",
+        compactSnapshot,
+      ].filter(Boolean).join("\n"),
+    });
+    const decision = response.object as ModelActionDecision;
+    if (decision.confidence === "low") {
+      return { ...heuristic, source: "heuristic", error: heuristic.error };
+    }
+
+    const element = decision.ref ? snapshot.elements.find((item) => item.ref === decision.ref) : undefined;
+    const target = decision.targetRef ? snapshot.elements.find((item) => item.ref === decision.targetRef) : undefined;
+    if (!element && !["scroll", "back", "wait", "press"].includes(decision.method)) {
+      return { ...heuristic, source: "heuristic", error: heuristic.error };
+    }
+
+    return {
+      method: decision.method,
+      ...(element ? { element } : {}),
+      ...(target ? { target } : {}),
+      ...(decision.text ? { text: decision.text } : heuristic.text ? { text: heuristic.text } : {}),
+      ...(decision.value ? { value: decision.value } : heuristic.value ? { value: heuristic.value } : value ? { value } : {}),
+      ...(decision.key ? { key: decision.key } : heuristic.key ? { key: heuristic.key } : {}),
+      twoStep: decision.twoStep,
+      reason: decision.reason,
+      source: "model",
+    };
+  } catch (err: unknown) {
+    bus.push({
+      type: "tool:finish",
+      agent: "Browser",
+      message: `browser_act model selector fallback: ${err instanceof Error ? err.message : String(err)}`,
+      metadata: { tool: "browser_act.selector" },
+    });
+    return { ...heuristic, source: "heuristic", error: heuristic.error };
+  }
+}
+
+const observeDecisionSchema = z.object({
+  observations: z.array(z.object({
+    ref: z.string(),
+    description: z.string(),
+    method: z.string().optional(),
+    arguments: z.array(z.string()).optional(),
+    confidence: z.enum(["low", "medium", "high"]),
+  })).max(12),
+});
+
+async function modelObserve(
+  ctx: EngineContext,
+  snapshot: SnapshotResult,
+  instruction: string,
+): Promise<string | undefined> {
+  if (!instruction.trim() || snapshot.elements.length === 0) return undefined;
+  try {
+    const resolved = resolveModel(ctx.model);
+    const response = await generateObject({
+      model: resolved.model,
+      schema: observeDecisionSchema,
+      temperature: 0,
+      prompt: [
+        "You are Servus Browser Observe. Return the most relevant actionable refs for the instruction.",
+        "Use only refs from the snapshot. Prefer visible active modal/dropdown/listbox elements.",
+        "",
+        `Instruction: ${instruction}`,
+        "",
+        snapshotToText({ ...snapshot, elements: snapshot.elements.slice(0, 100) }),
+      ].join("\n"),
+    });
+    const observations = response.object.observations
+      .filter((item) => snapshot.elements.some((element) => element.ref === item.ref))
+      .filter((item) => item.confidence !== "low");
+    if (!observations.length) return undefined;
+    return [
+      "Model-ranked actions:",
+      ...observations.map((item, index) => {
+        const args = item.arguments?.length ? ` args=${JSON.stringify(item.arguments)}` : "";
+        return `${index + 1}. ${item.ref}${item.method ? ` method=${item.method}` : ""}${args} - ${item.description} (${item.confidence})`;
+      }),
+    ].join("\n");
+  } catch {
+    return undefined;
+  }
+}
+
+const browserAgentStepSchema = z.object({
+  status: z.enum(["act", "done", "extract", "need_input"]),
+  instruction: z.string().optional().describe("One atomic browser action when status=act."),
+  value: z.string().optional().describe("Optional value for the action."),
+  question: z.string().optional().describe("One clear user question when status=need_input."),
+  reason: z.string(),
+});
+
+async function runBrowserAgentSubtask(
+  ctx: EngineContext,
+  runtime: BrowserRuntime,
+  instruction: string,
+  maxSteps: number,
+): Promise<string> {
+  const lines: string[] = [`Browser agent subtask: ${instruction}`];
+  for (let step = 1; step <= maxSteps; step++) {
+    const snapshot = await captureSnapshot(runtime, `${instruction} (agent step ${step})`, 90);
+    if (snapshot.blockedReason) {
+      const screenshot = await captureViewportScreenshot(runtime, `browser-agent-blocked-${step}`).catch(() => undefined);
+      return [
+        ...lines,
+        `Blocked: ${snapshot.blockedReason}`,
+        screenshot ? `Screenshot: ${screenshot}` : "",
+      ].filter(Boolean).join("\n");
+    }
+
+    let decision: z.infer<typeof browserAgentStepSchema>;
+    try {
+      const resolved = resolveModel(ctx.model);
+      const response = await generateObject({
+        model: resolved.model,
+        schema: browserAgentStepSchema,
+        temperature: 0,
+        prompt: [
+          "You are the Servus Browser Agent controller.",
+          "Given the user's browser subtask and current snapshot, choose exactly one next step.",
+          "Use status=done only when the current page already proves the subtask is complete.",
+          "Use status=need_input only when user data/choice is truly required.",
+          "Use status=act with one atomic action otherwise. Prefer dropdown/modal/listbox active surface controls.",
+          "",
+          `Subtask: ${instruction}`,
+          "",
+          snapshotToText(snapshot),
+        ].join("\n"),
+      });
+      decision = response.object;
+    } catch (err: unknown) {
+      return [
+        ...lines,
+        `Controller model failed: ${err instanceof Error ? err.message : String(err)}`,
+        snapshotToText(snapshot).slice(0, 4_000),
+      ].join("\n");
+    }
+
+    lines.push(`Step ${step}: ${decision.status} - ${decision.reason}`);
+    if (decision.status === "done") {
+      const screenshot = await captureViewportScreenshot(runtime, `browser-agent-done-${step}`).catch(() => undefined);
+      lines.push(`URL: ${runtime.page.url()}`);
+      if (screenshot) lines.push(`Screenshot: ${screenshot}`);
+      return lines.join("\n");
+    }
+    if (decision.status === "need_input") {
+      lines.push(`Needs input: ${decision.question ?? "More information is required."}`);
+      return lines.join("\n");
+    }
+    if (decision.status === "extract") {
+      const text = await runtime.page.locator("body").innerText({ timeout: 5_000 }).catch(async () => runtime.page.content());
+      lines.push(clamp(text, 8_000));
+      return lines.join("\n");
+    }
+
+    const actionInstruction = decision.instruction ?? instruction;
+    const cached = await tryCachedAction(ctx, runtime, actionInstruction, decision.value);
+    if (cached) {
+      lines.push(formatOutcome(runtime, cached));
+      continue;
+    }
+
+    const actionSnapshot = await captureSnapshot(runtime, actionInstruction, 100);
+    const action = await chooseActionWithModel(ctx, actionSnapshot, actionInstruction, decision.value);
+    if (!action.element) {
+      lines.push(`Unable to select action target: ${action.error ?? "no element"}`);
+      return lines.join("\n");
+    }
+    if (action.method === "drag" || action.method === "upload") {
+      lines.push(`Action ${action.method} requires explicit refs; use browser_drag_ref or browser_upload_ref.`);
+      return lines.join("\n");
+    }
+    const outcome = await runRefActionWithSelfHeal(ctx, runtime, action.element, action.method, {
+      text: action.text,
+      value: action.value,
+      key: action.key,
+      instruction: actionInstruction,
+    });
+    lines.push(formatOutcome(runtime, outcome));
+    if (outcome.success) {
+      cacheSuccessfulAction(runtime, actionInstruction, action.element, action.method, {
+        text: action.text,
+        value: action.value,
+        key: action.key,
+      });
+    }
+    if (!outcome.success || outcome.noProgress) return lines.join("\n");
+  }
+  lines.push(`Stopped after ${maxSteps} step(s). Take browser_snapshot and continue with a smaller action.`);
+  return lines.join("\n");
+}
+
+function cacheFilePath(sessionId: string): string {
+  return join(browserSessionDir(sessionId), "action-cache.json");
+}
+
+function loadActionCache(sessionId: string): CachedBrowserAction[] {
+  const path = cacheFilePath(sessionId);
+  if (!existsSync(path)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as CachedBrowserAction[];
+    return Array.isArray(parsed) ? parsed.slice(-MAX_ACTION_CACHE_ENTRIES) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveActionCache(sessionId: string, entries: CachedBrowserAction[]): void {
+  const path = cacheFilePath(sessionId);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(entries.slice(-MAX_ACTION_CACHE_ENTRIES), null, 2) + "\n");
+}
+
+function instructionCacheKey(instruction: string, value?: string): string {
+  return normalizeText(`${instruction} ${value ?? ""}`).slice(0, 300);
+}
+
+function urlCacheKey(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url.split(/[?#]/)[0] ?? url;
+  }
+}
+
+function cacheSuccessfulAction(
+  runtime: BrowserRuntime,
+  instruction: string,
+  element: SnapshotElement,
+  method: BrowserMethod,
+  options: { text?: string; value?: string; key?: string },
+): void {
+  if (!["click", "double_click", "fill", "type", "select", "hover", "press"].includes(method)) return;
+  const instructionKey = instructionCacheKey(instruction, options.value ?? options.text);
+  if (!instructionKey) return;
+  const urlKey = urlCacheKey(runtime.page.url());
+  const cache = loadActionCache(runtime.sessionId)
+    .filter((entry) => !(entry.instructionKey === instructionKey && entry.urlKey === urlKey));
+  cache.push({
+    id: createHash("sha1").update(`${urlKey}|${instructionKey}|${element.selector}`).digest("hex").slice(0, 16),
+    instructionKey,
+    urlKey,
+    createdAt: Date.now(),
+    hits: 0,
+    method,
+    locatorQuery: element.locatorQuery,
+    selector: element.selector,
+    name: element.label || element.text || element.placeholder || element.href || element.tag,
+    ...(options.text ? { text: options.text } : {}),
+    ...(options.value ? { value: options.value } : {}),
+    ...(options.key ? { key: options.key } : {}),
+  });
+  saveActionCache(runtime.sessionId, cache);
+}
+
+async function tryCachedAction(
+  ctx: EngineContext,
+  runtime: BrowserRuntime,
+  instruction: string,
+  value?: string,
+): Promise<ActionOutcome | undefined> {
+  const instructionKey = instructionCacheKey(instruction, value);
+  const urlKey = urlCacheKey(runtime.page.url());
+  const cache = loadActionCache(runtime.sessionId);
+  const entry = [...cache].reverse().find((candidate) =>
+    candidate.urlKey === urlKey &&
+    (candidate.instructionKey === instructionKey || instructionKey.includes(candidate.instructionKey) || candidate.instructionKey.includes(instructionKey)),
+  );
+  if (!entry) return undefined;
+
+  const element: SnapshotElement = {
+    ref: `cached_${entry.id}`,
+    legacyId: 0,
+    tag: "cached",
+    role: "",
+    type: "",
+    text: entry.name,
+    label: entry.name,
+    placeholder: "",
+    href: "",
+    selector: entry.selector,
+    visible: true,
+    enabled: true,
+    locatorQuery: entry.locatorQuery,
+  };
+  const outcome = await performRefAction(ctx, runtime, element, entry.method, {
+    text: value ?? entry.text,
+    value: value ?? entry.value,
+    key: entry.key,
+    instruction,
+  }, 1).catch(() => undefined);
+  if (!outcome?.success) return undefined;
+  const updated = cache.map((candidate) =>
+    candidate.id === entry.id
+      ? { ...candidate, hits: candidate.hits + 1, lastUsedAt: Date.now() }
+      : candidate,
+  );
+  saveActionCache(runtime.sessionId, updated);
+  return {
+    ...outcome,
+    content: `${outcome.content} Replayed cached browser action ${entry.id}.`,
   };
 }
 
@@ -2590,14 +3388,18 @@ export function createPlaywrightTools(ctx: EngineContext) {
     }),
 
     browser_observe: tool({
-      description: "Compatibility alias for browser_snapshot. Returns visible interactive elements with legacy numeric IDs and stable refs.",
+      description: "Servus observe. Captures the page and returns model-ranked actionable refs plus visible interactive elements.",
       inputSchema: z.object({
         instruction: z.string().optional().describe("Optional goal for the observation."),
       }),
       execute: async ({ instruction }) => withToolEvents("browser_observe", instruction ?? "Observe page", async () => {
         const runtime = await getRuntime(ctx);
         const snapshot = await captureSnapshot(runtime, instruction);
-        return snapshotToText(snapshot, true);
+        const ranked = instruction ? await modelObserve(ctx, snapshot, instruction) : undefined;
+        return [
+          ranked,
+          snapshotToText(snapshot, true),
+        ].filter(Boolean).join("\n\n");
       }).catch((err: unknown) => `Error observing page: ${err instanceof Error ? err.message : String(err)}`),
     }),
 
@@ -2606,11 +3408,16 @@ export function createPlaywrightTools(ctx: EngineContext) {
       inputSchema: z.object({
         instruction: z.string().describe("Atomic action, e.g. click Search, fill email with user@example.com, select Economy."),
         value: z.string().optional().describe("Optional explicit text/select value for fill/select actions."),
+        useCache: z.boolean().optional().describe("Replay a successful cached action when available. Defaults true."),
       }),
-      execute: async ({ instruction, value }) => withToolEvents("browser_act", instruction, async () => {
+      execute: async ({ instruction, value, useCache }) => withToolEvents("browser_act", instruction, async () => {
         const runtime = await getRuntime(ctx);
+        if (useCache !== false) {
+          const cached = await tryCachedAction(ctx, runtime, instruction, value);
+          if (cached) return `${formatOutcome(runtime, cached)}\nCached: true`;
+        }
         const snapshot = await captureSnapshot(runtime, instruction);
-        const decision = chooseAction(snapshot.elements, instruction, value);
+        const decision = await chooseActionWithModel(ctx, snapshot, instruction, value);
         if (decision.error || !decision.element) {
           if (decision.method === "scroll") {
             const direction = /left/i.test(instruction)
@@ -2636,14 +3443,60 @@ export function createPlaywrightTools(ctx: EngineContext) {
           return `Unable to act safely: ${decision.error ?? "No target element selected."}\nTake browser_snapshot and use a ref-specific tool.`;
         }
 
+        if (decision.method === "drag") {
+          if (!decision.target) return "Unable to drag safely: no target ref selected. Use browser_drag_ref with explicit source and target refs.";
+          const outcome = await dragBetweenRefs(ctx, runtime, decision.element, decision.target, instruction);
+          return formatOutcome(runtime, outcome);
+        }
+
+        if (decision.method === "upload") {
+          const filePath = decision.value ?? decision.text ?? value;
+          if (!filePath) return "Unable to upload safely: no file path was provided.";
+          const outcome = await uploadFileToRef(ctx, runtime, decision.element, filePath, instruction);
+          return formatOutcome(runtime, outcome);
+        }
+
         const outcome = await runRefActionWithSelfHeal(ctx, runtime, decision.element, decision.method, {
           text: decision.text,
           value: decision.value,
           key: decision.key,
           instruction,
         });
+        if (outcome.success) {
+          cacheSuccessfulAction(runtime, instruction, decision.element, decision.method, {
+            text: decision.text,
+            value: decision.value,
+            key: decision.key,
+          });
+        }
+        if (outcome.success && decision.twoStep) {
+          const fresh = await captureSnapshot(runtime, `Second step after ${instruction}`);
+          const nextValue = decision.value ?? decision.text ?? value;
+          if (nextValue) {
+            const option = findOptionCandidate(fresh.elements, nextValue, decision.element);
+            if (option) {
+              const second = await runRefActionWithSelfHeal(ctx, runtime, option, "click", {
+                instruction: `Click visible option ${nextValue} after opening control for: ${instruction}`,
+              });
+              return `${formatOutcome(runtime, outcome)}\n\nSecond step:\n${formatOutcome(runtime, second)}`;
+            }
+          }
+        }
         return formatOutcome(runtime, outcome);
       }).catch((err: unknown) => `Error in browser_act: ${err instanceof Error ? err.message : String(err)}`),
+      toModelOutput: ({ output }) => modelOutputWithOptionalScreenshot(output),
+    }),
+
+    browser_agent: tool({
+      description: "Run a bounded Servus mini browser controller for a high-level browser subtask. It plans one atomic action at a time, captures snapshots between actions, and stops on blockers or completion.",
+      inputSchema: z.object({
+        instruction: z.string().describe("High-level browser subtask, e.g. choose 2D format from the open modal or find evening showtimes."),
+        maxSteps: z.number().int().positive().max(8).optional(),
+      }),
+      execute: async ({ instruction, maxSteps }) => withToolEvents("browser_agent", instruction, async () => {
+        const runtime = await getRuntime(ctx);
+        return runBrowserAgentSubtask(ctx, runtime, instruction, maxSteps ?? 4);
+      }).catch((err: unknown) => `Error in browser_agent: ${err instanceof Error ? err.message : String(err)}`),
       toModelOutput: ({ output }) => modelOutputWithOptionalScreenshot(output),
     }),
 
@@ -2697,6 +3550,52 @@ export function createPlaywrightTools(ctx: EngineContext) {
         const outcome = await runRefActionWithSelfHeal(ctx, runtime, element, "select", { value });
         return formatOutcome(runtime, outcome);
       }).catch((err: unknown) => `Error selecting ref ${ref}: ${err instanceof Error ? err.message : String(err)}`),
+      toModelOutput: ({ output }) => modelOutputWithOptionalScreenshot(output),
+    }),
+
+    browser_hover_ref: tool({
+      description: "Hover a stable ref from browser_snapshot.",
+      inputSchema: z.object({
+        ref: z.string().describe("Stable ref from browser_snapshot."),
+      }),
+      execute: async ({ ref }) => withToolEvents("browser_hover_ref", `Hover ${ref}`, async () => {
+        const runtime = await getRuntime(ctx);
+        const element = await elementByRef(runtime, ref);
+        const outcome = await runRefActionWithSelfHeal(ctx, runtime, element, "hover", {});
+        return formatOutcome(runtime, outcome);
+      }).catch((err: unknown) => `Error hovering ref ${ref}: ${err instanceof Error ? err.message : String(err)}`),
+      toModelOutput: ({ output }) => modelOutputWithOptionalScreenshot(output),
+    }),
+
+    browser_drag_ref: tool({
+      description: "Drag one stable ref onto another stable ref. Use for sliders, drag-and-drop upload zones, sortable lists, and canvas-like controls when refs exist.",
+      inputSchema: z.object({
+        sourceRef: z.string().describe("Source ref from browser_snapshot."),
+        targetRef: z.string().describe("Target ref from browser_snapshot."),
+        reason: z.string().optional(),
+      }),
+      execute: async ({ sourceRef, targetRef, reason }) => withToolEvents("browser_drag_ref", `Drag ${sourceRef} to ${targetRef}`, async () => {
+        const runtime = await getRuntime(ctx);
+        const source = await elementByRef(runtime, sourceRef);
+        const target = await elementByRef(runtime, targetRef);
+        const outcome = await dragBetweenRefs(ctx, runtime, source, target, reason);
+        return formatOutcome(runtime, outcome);
+      }).catch((err: unknown) => `Error dragging refs: ${err instanceof Error ? err.message : String(err)}`),
+      toModelOutput: ({ output }) => modelOutputWithOptionalScreenshot(output),
+    }),
+
+    browser_upload_ref: tool({
+      description: "Upload a local file through a file input ref from browser_snapshot.",
+      inputSchema: z.object({
+        ref: z.string().describe("File input ref from browser_snapshot."),
+        path: z.string().describe("Local file path to upload. Relative paths resolve from the run cwd."),
+      }),
+      execute: async ({ ref, path }) => withToolEvents("browser_upload_ref", `Upload ${path}`, async () => {
+        const runtime = await getRuntime(ctx);
+        const element = await elementByRef(runtime, ref);
+        const outcome = await uploadFileToRef(ctx, runtime, element, path, `Upload ${path}`);
+        return formatOutcome(runtime, outcome);
+      }).catch((err: unknown) => `Error uploading file: ${err instanceof Error ? err.message : String(err)}`),
       toModelOutput: ({ output }) => modelOutputWithOptionalScreenshot(output),
     }),
 
@@ -2815,6 +3714,122 @@ export function createPlaywrightTools(ctx: EngineContext) {
         await savePageState(runtime, "open");
         return `Went back. Current URL: ${runtime.page.url()}`;
       }).catch((err: unknown) => `Error going back: ${err instanceof Error ? err.message : String(err)}`),
+    }),
+
+    browser_forward: tool({
+      description: "Go forward in browser history.",
+      inputSchema: z.object({}),
+      execute: async () => withToolEvents("browser_forward", "Go forward", async () => {
+        const runtime = await getRuntime(ctx);
+        await runtime.page.goForward({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+        await settlePage(runtime.page);
+        await savePageState(runtime, "open");
+        return `Went forward. Current URL: ${runtime.page.url()}`;
+      }).catch((err: unknown) => `Error going forward: ${err instanceof Error ? err.message : String(err)}`),
+    }),
+
+    browser_reload: tool({
+      description: "Reload the current page and wait for DOM/network quiet.",
+      inputSchema: z.object({}),
+      execute: async () => withToolEvents("browser_reload", "Reload page", async () => {
+        const runtime = await getRuntime(ctx);
+        await runtime.page.reload({ waitUntil: "domcontentloaded" });
+        await settlePage(runtime.page);
+        await savePageState(runtime, "open");
+        return `Reloaded. Current URL: ${runtime.page.url()}`;
+      }).catch((err: unknown) => `Error reloading page: ${err instanceof Error ? err.message : String(err)}`),
+    }),
+
+    browser_wait_for_selector: tool({
+      description: "Wait for a CSS selector to appear, disappear, attach, or become visible.",
+      inputSchema: z.object({
+        selector: z.string().describe("CSS selector to wait for."),
+        state: z.enum(["attached", "detached", "visible", "hidden"]).optional(),
+        timeoutMs: z.number().int().positive().max(60_000).optional(),
+      }),
+      execute: async ({ selector, state, timeoutMs }) => withToolEvents("browser_wait_for_selector", `Wait for ${selector}`, async () => {
+        const runtime = await getRuntime(ctx);
+        await runtime.page.waitForSelector(selector, {
+          state: state ?? "visible",
+          timeout: timeoutMs ?? 15_000,
+        });
+        await savePageState(runtime, "open");
+        return `Selector ${selector} is ${state ?? "visible"}.\nURL: ${runtime.page.url()}`;
+      }).catch((err: unknown) => `Error waiting for selector: ${err instanceof Error ? err.message : String(err)}`),
+    }),
+
+    browser_pages: tool({
+      description: "List open browser pages/tabs and the currently selected page.",
+      inputSchema: z.object({}),
+      execute: async () => withToolEvents("browser_pages", "List pages", async () => {
+        const runtime = await getRuntime(ctx);
+        const pages = runtime.context.pages();
+        const lines = await Promise.all(pages.map(async (page, index) => {
+          const title = await page.title().catch(() => "");
+          const marker = page === runtime.page ? "*" : " ";
+          return `${marker} ${index}: ${title || "(untitled)"} - ${page.url()}`;
+        }));
+        return lines.join("\n") || "No pages open.";
+      }).catch((err: unknown) => `Error listing pages: ${err instanceof Error ? err.message : String(err)}`),
+    }),
+
+    browser_new_page: tool({
+      description: "Open a new browser tab/page, optionally navigating to a URL, and make it active.",
+      inputSchema: z.object({
+        url: z.string().optional().describe("Optional URL to open."),
+      }),
+      execute: async ({ url }) => withToolEvents("browser_new_page", url ? `New page ${url}` : "New page", async () => {
+        const runtime = await getRuntime(ctx);
+        runtime.page = await runtime.context.newPage();
+        runtime.page.setDefaultTimeout(loadConfig().browser?.timeoutMs ?? DEFAULT_BROWSER_TIMEOUT_MS);
+        runtime.page.on("crash", () => {
+          updateBrowserSessionState(sessionId, { status: "crashed", blockedReason: "Browser page crashed" });
+        });
+        if (url) {
+          await runtime.page.goto(normalizeUrl(url), { waitUntil: "domcontentloaded" });
+          await settlePage(runtime.page);
+        }
+        await savePageState(runtime, "open");
+        return `Opened page ${runtime.context.pages().indexOf(runtime.page)}: ${runtime.page.url()}`;
+      }).catch((err: unknown) => `Error opening new page: ${err instanceof Error ? err.message : String(err)}`),
+    }),
+
+    browser_select_page: tool({
+      description: "Switch the active browser page/tab by index from browser_pages.",
+      inputSchema: z.object({
+        index: z.number().int().nonnegative().describe("Page index from browser_pages."),
+      }),
+      execute: async ({ index }) => withToolEvents("browser_select_page", `Select page ${index}`, async () => {
+        const runtime = await getRuntime(ctx);
+        const page = runtime.context.pages()[index];
+        if (!page) return `No browser page at index ${index}.`;
+        runtime.page = page;
+        await runtime.page.bringToFront().catch(() => undefined);
+        await settlePage(runtime.page);
+        await savePageState(runtime, "open");
+        return `Selected page ${index}: ${runtime.page.url()}`;
+      }).catch((err: unknown) => `Error selecting page: ${err instanceof Error ? err.message : String(err)}`),
+    }),
+
+    browser_close_page: tool({
+      description: "Close a browser page/tab by index. If no index is provided, close the active page and switch to another page.",
+      inputSchema: z.object({
+        index: z.number().int().nonnegative().optional(),
+      }),
+      execute: async ({ index }) => withToolEvents("browser_close_page", "Close page", async () => {
+        const runtime = await getRuntime(ctx);
+        const pages = runtime.context.pages();
+        const target = typeof index === "number" ? pages[index] : runtime.page;
+        if (!target) return `No browser page at index ${index}.`;
+        if (pages.length <= 1) return "Refused to close the only open page. Use browser_close to close the browser session explicitly.";
+        const closedIndex = pages.indexOf(target);
+        await target.close().catch(() => undefined);
+        const remaining = runtime.context.pages();
+        runtime.page = remaining[Math.max(0, Math.min(closedIndex, remaining.length - 1))] ?? remaining[0]!;
+        await runtime.page.bringToFront().catch(() => undefined);
+        await savePageState(runtime, "open");
+        return `Closed page ${closedIndex}. Active page: ${runtime.page.url()}`;
+      }).catch((err: unknown) => `Error closing page: ${err instanceof Error ? err.message : String(err)}`),
     }),
 
     browser_hover: tool({
@@ -3064,6 +4079,151 @@ export function createPlaywrightTools(ctx: EngineContext) {
         return `Screenshot saved: ${targetPath}\nURL: ${runtime.page.url()}`;
       }).catch((err: unknown) => `Error taking screenshot: ${err instanceof Error ? err.message : String(err)}`),
       toModelOutput: ({ output }) => modelOutputWithOptionalScreenshot(output),
+    }),
+
+    browser_element_info: tool({
+      description: "Return detailed DOM/accessibility/bounds info for a stable ref from browser_snapshot.",
+      inputSchema: z.object({
+        ref: z.string().describe("Stable ref from browser_snapshot."),
+      }),
+      execute: async ({ ref }) => withToolEvents("browser_element_info", `Inspect ${ref}`, async () => {
+        const runtime = await getRuntime(ctx);
+        const element = await elementByRef(runtime, ref);
+        const locator = resolveLocator(runtime, element);
+        const details = await locator.evaluate((el) => {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          const attrs: Record<string, string> = {};
+          for (const attr of Array.from(el.attributes)) attrs[attr.name] = attr.value;
+          return {
+            tag: el.tagName.toLowerCase(),
+            text: (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 1000),
+            attributes: attrs,
+            bounds: {
+              x: Math.round(rect.x),
+              y: Math.round(rect.y),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height),
+            },
+            style: {
+              display: style.display,
+              visibility: style.visibility,
+              position: style.position,
+              zIndex: style.zIndex,
+              overflow: style.overflow,
+              pointerEvents: style.pointerEvents,
+              cursor: style.cursor,
+            },
+          };
+        });
+        return JSON.stringify({
+          ref,
+          url: runtime.page.url(),
+          snapshotElement: element,
+          details,
+        }, null, 2);
+      }).catch((err: unknown) => `Error inspecting element ${ref}: ${err instanceof Error ? err.message : String(err)}`),
+    }),
+
+    browser_highlight: tool({
+      description: "Temporarily highlight one or more refs in the browser and take a screenshot.",
+      inputSchema: z.object({
+        refs: z.array(z.string()).min(1).max(20).describe("Refs from browser_snapshot."),
+      }),
+      execute: async ({ refs }) => withToolEvents("browser_highlight", `Highlight ${refs.join(", ")}`, async () => {
+        const runtime = await getRuntime(ctx);
+        const elements = await Promise.all(refs.map((ref) => elementByRef(runtime, ref).catch(() => undefined)));
+        const visible = elements.filter((element): element is SnapshotElement => Boolean(element));
+        const screenshot = await captureAnnotatedScreenshot(runtime, "highlight", visible);
+        return `Highlighted ${visible.length} refs.\nScreenshot: ${screenshot}\nURL: ${runtime.page.url()}`;
+      }).catch((err: unknown) => `Error highlighting refs: ${err instanceof Error ? err.message : String(err)}`),
+      toModelOutput: ({ output }) => modelOutputWithOptionalScreenshot(output),
+    }),
+
+    browser_set_viewport: tool({
+      description: "Set the current page viewport size.",
+      inputSchema: z.object({
+        width: z.number().int().min(320).max(3840),
+        height: z.number().int().min(240).max(2160),
+      }),
+      execute: async ({ width, height }) => withToolEvents("browser_set_viewport", `Set viewport ${width}x${height}`, async () => {
+        const runtime = await getRuntime(ctx);
+        await runtime.page.setViewportSize({ width, height });
+        await settlePage(runtime.page);
+        await savePageState(runtime, "open");
+        return `Viewport set to ${width}x${height}.`;
+      }).catch((err: unknown) => `Error setting viewport: ${err instanceof Error ? err.message : String(err)}`),
+    }),
+
+    browser_cookies: tool({
+      description: "Read, add, or clear browser cookies for the persistent context.",
+      inputSchema: z.object({
+        action: z.enum(["list", "add", "clear"]).optional(),
+        cookies: z.array(z.object({
+          name: z.string(),
+          value: z.string(),
+          domain: z.string().optional(),
+          path: z.string().optional(),
+          url: z.string().optional(),
+        })).optional(),
+      }),
+      execute: async ({ action, cookies }) => withToolEvents("browser_cookies", `${action ?? "list"} cookies`, async () => {
+        const runtime = await getRuntime(ctx);
+        const op = action ?? "list";
+        if (op === "list") {
+          const items = await runtime.context.cookies();
+          return JSON.stringify(items.map((cookie) => ({
+            name: cookie.name,
+            domain: cookie.domain,
+            path: cookie.path,
+            expires: cookie.expires,
+            sameSite: cookie.sameSite,
+            secure: cookie.secure,
+            httpOnly: cookie.httpOnly,
+          })), null, 2);
+        }
+        const blocked = await guardRisk(ctx, `browser_cookies_${op}`, `${op} browser cookies`);
+        if (blocked) return blocked;
+        if (op === "clear") {
+          await runtime.context.clearCookies();
+          return "Cleared browser cookies.";
+        }
+        await runtime.context.addCookies((cookies ?? []).map((cookie) => ({
+          ...cookie,
+          url: cookie.url ?? (!cookie.domain ? runtime.page.url() : undefined),
+          path: cookie.path ?? "/",
+        })));
+        return `Added ${cookies?.length ?? 0} cookie(s).`;
+      }).catch((err: unknown) => `Error handling cookies: ${err instanceof Error ? err.message : String(err)}`),
+    }),
+
+    browser_set_headers: tool({
+      description: "Set extra HTTP headers for future browser requests in this session.",
+      inputSchema: z.object({
+        headers: z.record(z.string(), z.string()).describe("Header names and values."),
+      }),
+      execute: async ({ headers }) => withToolEvents("browser_set_headers", "Set browser headers", async () => {
+        const runtime = await getRuntime(ctx);
+        const blocked = await guardRisk(ctx, "browser_set_headers", JSON.stringify(Object.keys(headers)));
+        if (blocked) return blocked;
+        await runtime.context.setExtraHTTPHeaders(headers);
+        return `Set ${Object.keys(headers).length} extra HTTP header(s).`;
+      }).catch((err: unknown) => `Error setting headers: ${err instanceof Error ? err.message : String(err)}`),
+    }),
+
+    browser_add_init_script: tool({
+      description: "Add a JavaScript init script to future pages in this browser context. Requires consent because it can alter site behavior.",
+      inputSchema: z.object({
+        script: z.string().max(20_000).describe("JavaScript source to run before page scripts."),
+        reason: z.string().optional(),
+      }),
+      execute: async ({ script, reason }) => withToolEvents("browser_add_init_script", "Add browser init script", async () => {
+        const runtime = await getRuntime(ctx);
+        const blocked = await guardRisk(ctx, "browser_add_init_script", reason ? `${reason}\n${script.slice(0, 1000)}` : script.slice(0, 1000));
+        if (blocked) return blocked;
+        await runtime.context.addInitScript(script);
+        return "Init script added for future pages.";
+      }).catch((err: unknown) => `Error adding init script: ${err instanceof Error ? err.message : String(err)}`),
     }),
 
     browser_close: tool({

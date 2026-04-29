@@ -1,8 +1,10 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import { Shell } from "./layout/shell.js";
 import { CommandPalette, type CommandItem } from "./components/command-palette.js";
-import { NewTask, type TaskConfig } from "./screens/new-task.js";
+import { TuiOverlayPanel } from "./components/tui-overlays.js";
+import { HomeScreen } from "./screens/home.js";
+import type { TaskConfig } from "./screens/new-task.js";
 import { Dashboard } from "./screens/dashboard.js";
 import { ConfigScreen } from "./screens/config.js";
 import { SessionsScreen } from "./screens/sessions.js";
@@ -15,8 +17,9 @@ import { createSession, getSession, updateSession, type SessionRecord } from "..
 import { bus } from "../events.js";
 import { loadConfig, saveConfig } from "../config.js";
 import type { OrchestratorConfig } from "../orchestrator.js";
-import type { AgentBackend } from "../agent.js";
+import { normalizeAgentBackend, type AgentBackend } from "../agent.js";
 import type { TaskDomain } from "../engine.js";
+import type { TuiOverlay } from "./tui-types.js";
 
 interface Props {
   initialScreen?: Screen;
@@ -31,13 +34,16 @@ export function App({ initialScreen, initialConfig }: Props) {
   const [screen, setScreen] = useState<Screen>(normalizeScreen(initialScreen ?? "launchpad"));
   const [orchConfig, setOrchConfig] = useState<OrchestratorConfig | null>(initialConfig ?? null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [overlay, setOverlay] = useState<TuiOverlay | null>(null);
   const [clearSignal, setClearSignal] = useState(0);
   const [inputLocked, setInputLocked] = useState(false);
-  const [secretBuffer, setSecretBuffer] = useState("");
-  const [celebrate, setCelebrate] = useState(false);
 
-  const navigate = useCallback((next: Screen) => setScreen(normalizeScreen(next)), []);
+  const navigate = useCallback((next: Screen) => {
+    setOverlay(null);
+    setScreen(normalizeScreen(next));
+  }, []);
   const goHome = useCallback(() => {
+    setOverlay(null);
     setScreen("launchpad");
   }, []);
 
@@ -47,9 +53,11 @@ export function App({ initialScreen, initialConfig }: Props) {
       const newTask = options.sameSession
         ? [
             "Same Servus session continuation.",
-            "The user answered the latest clarification or approval prompt:",
+            "The user sent this follow-up message in the same session:",
             "",
             followUpText,
+            "",
+            "Continue from the existing session transcript and do not restart or reroute the task unless the user explicitly asks.",
           ].join("\n")
         : `Follow-up from user:\n\n${followUpText}\n\n---\n(Original task: ${prev.task})`;
 
@@ -92,7 +100,7 @@ export function App({ initialScreen, initialConfig }: Props) {
       task: newTask,
       cwd: session.cwd,
       model: session.model,
-      backend: session.backend as AgentBackend,
+      backend: normalizeAgentBackend(session.backend),
       maxConsecutiveFailures: 5,
       maxBudgetUsd: undefined,
       preferredDomain: isConcreteDomain(session.domain) ? session.domain : "auto",
@@ -144,52 +152,34 @@ export function App({ initialScreen, initialConfig }: Props) {
   }, []);
 
   const commands: CommandItem[] = useMemo(() => [
-    { id: "launchpad", label: "New Run", hint: "Launchpad", group: "Navigate", run: () => navigate("launchpad") },
+    { id: "launchpad", label: "Home", hint: "chat composer", group: "Navigate", run: () => navigate("launchpad") },
     { id: "live-run", label: "Live Run", hint: "watch active session", group: "Navigate", run: () => navigate("live-run") },
-    { id: "sessions", label: "Sessions", hint: "history and resume", group: "Navigate", run: () => navigate("sessions") },
-    { id: "capabilities", label: "Capabilities", hint: "tools/providers/readiness", group: "Navigate", run: () => navigate("capabilities") },
+    { id: "sessions", label: "Sessions", hint: "history and resume", group: "Overlays", run: () => setOverlay("sessions") },
+    { id: "models", label: "Models", hint: "provider-aware picker", group: "Overlays", run: () => setOverlay("models") },
+    { id: "mcp", label: "MCP", hint: "servers/tools/resources", group: "Overlays", run: () => setOverlay("mcp") },
+    { id: "capabilities", label: "Capabilities", hint: "tools/providers/readiness", group: "Overlays", run: () => setOverlay("capabilities") },
     { id: "plugins", label: "Plugins & Skills", hint: "local extension inventory", group: "Navigate", run: () => navigate("plugins") },
-    { id: "settings", label: "Settings", hint: "providers/runtime/browser/safety", group: "Navigate", run: () => navigate("settings") },
+    { id: "settings", label: "Settings", hint: "providers/runtime/browser/safety", group: "Overlays", run: () => setOverlay("settings") },
     { id: "jobs", label: "Background Jobs", hint: "scheduled/background runs", group: "Navigate", run: () => navigate("background") },
+    { id: "help", label: "Help", hint: "shortcuts and slash commands", group: "Overlays", run: () => setOverlay("help") },
     { id: "clear-logs", label: "Clear Live Run Logs", hint: "dashboard only", group: "Run", run: () => setClearSignal((value) => value + 1) },
     { id: "toggle-headless", label: "Toggle Browser Headless", hint: "updates default", group: "Settings", run: toggleBrowserHeadless },
-    { id: "glow", label: "Toggle Glow Mode", hint: "hidden console effect", group: "Fun", run: () => setCelebrate((value) => !value) },
   ], [navigate]);
 
-  useEffect(() => {
-    if (!celebrate) return;
-    const timer = setTimeout(() => setCelebrate(false), 12_000);
-    return () => clearTimeout(timer);
-  }, [celebrate]);
-
   useInput((input, key) => {
-    if (key.ctrl && input === "k") {
+    if ((key.ctrl && input === "k") || (key.ctrl && input === "p")) {
       if (inputLocked && !paletteOpen) return;
       setPaletteOpen((value) => !value);
       return;
     }
     if (paletteOpen || inputLocked) return;
-    if (/^[a-z]$/i.test(input)) {
-      const nextBuffer = (secretBuffer + input.toLowerCase()).slice(-6);
-      setSecretBuffer(nextBuffer);
-      if (nextBuffer === "servus") setCelebrate(true);
-    }
-    const hotkeys: Record<string, Screen> = {
-      "1": "launchpad",
-      "2": "live-run",
-      "3": "sessions",
-      "4": "capabilities",
-      "5": "plugins",
-      "6": "settings",
-      "7": "background",
-    };
-    if (hotkeys[input]) {
-      navigate(hotkeys[input]);
+    if (key.escape && overlay) {
+      setOverlay(null);
     }
   });
 
-  const title = screenTitle(screen);
-  const right = orchConfig ? `${orchConfig.backend} | ${orchConfig.model}` : "ready";
+  const title = overlay ? screenTitleForOverlay(overlay) : screenTitle(screen);
+  const right = orchConfig ? `${formatBackendLabel(orchConfig.backend)} | ${orchConfig.model}` : "ready";
 
   return (
     <Shell
@@ -199,56 +189,99 @@ export function App({ initialScreen, initialConfig }: Props) {
       onNavigate={navigate}
       footerHints={footerHints(screen, !!orchConfig)}
       activeRun={!!orchConfig}
-      celebrate={celebrate}
+      celebrate={false}
     >
-      {paletteOpen && <CommandPalette items={commands} onClose={() => setPaletteOpen(false)} />}
+      {paletteOpen ? (
+        <CommandPalette items={commands} onClose={() => setPaletteOpen(false)} />
+      ) : (
+        <>
+          {overlay ? (
+            renderOverlay(overlay, {
+              cwd: orchConfig?.cwd ?? process.cwd(),
+              onClose: () => setOverlay(null),
+              onFollowSession: handleSessionFollowUp,
+              setInputLocked,
+              inputBlocked: false,
+            })
+          ) : screen === "launchpad" && (
+            <HomeScreen
+              onSubmit={handleTaskSubmit}
+              onOpenOverlay={setOverlay}
+              onInputLockedChange={setInputLocked}
+              inputBlocked={false}
+            />
+          )}
 
-      {screen === "launchpad" && (
-        <NewTask
-          onSubmit={handleTaskSubmit}
-          onBack={goHome}
-          onInputLockedChange={setInputLocked}
-          inputBlocked={paletteOpen}
-        />
-      )}
+          {orchConfig && (
+            <Dashboard
+              config={orchConfig}
+              visible={!overlay && screen === "live-run"}
+              onBack={goHome}
+              onFollowUp={handleFollowUp}
+              onOpenOverlay={setOverlay}
+              clearSignal={clearSignal}
+              onInputLockedChange={setInputLocked}
+              inputBlocked={false}
+            />
+          )}
 
-      {orchConfig && (
-        <Dashboard
-          config={orchConfig}
-          visible={screen === "live-run"}
-          onBack={goHome}
-          onFollowUp={handleFollowUp}
-          clearSignal={clearSignal}
-          onInputLockedChange={setInputLocked}
-          inputBlocked={paletteOpen}
-        />
-      )}
+          {!overlay && screen === "live-run" && !orchConfig && (
+            <Box flexDirection="column" marginTop={1}>
+              <Text color="gray">No active foreground run.</Text>
+              <Text color="gray">Use Home to start a task. The live run will attach to the same session.</Text>
+            </Box>
+          )}
 
-      {screen === "live-run" && !orchConfig && (
-        <Box flexDirection="column" marginTop={1}>
-          <Text color="gray">No active foreground run.</Text>
-          <Text color="gray">Open Launchpad and start a task in foreground mode to attach the live dashboard.</Text>
-        </Box>
-      )}
-
-      {screen === "sessions" && (
-        <SessionsScreen
-          onBack={goHome}
-          onFollowUp={handleSessionFollowUp}
-          onInputLockedChange={setInputLocked}
-          inputBlocked={paletteOpen}
-        />
-      )}
-      {screen === "background" && (
-        <BackgroundScreen onBack={goHome} onInputLockedChange={setInputLocked} inputBlocked={paletteOpen} />
-      )}
-      {screen === "capabilities" && <CapabilitiesScreen cwd={orchConfig?.cwd} />}
-      {screen === "plugins" && <PluginsSkillsScreen cwd={orchConfig?.cwd} inputBlocked={paletteOpen} />}
-      {screen === "settings" && (
-        <ConfigScreen onBack={goHome} onInputLockedChange={setInputLocked} inputBlocked={paletteOpen} />
+          {!overlay && screen === "sessions" && (
+            <SessionsScreen
+              onBack={goHome}
+              onFollowUp={handleSessionFollowUp}
+              onInputLockedChange={setInputLocked}
+              inputBlocked={false}
+            />
+          )}
+          {!overlay && screen === "background" && (
+            <BackgroundScreen onBack={goHome} onInputLockedChange={setInputLocked} inputBlocked={false} />
+          )}
+          {!overlay && screen === "capabilities" && <CapabilitiesScreen cwd={orchConfig?.cwd} />}
+          {!overlay && screen === "plugins" && <PluginsSkillsScreen cwd={orchConfig?.cwd} inputBlocked={false} />}
+          {!overlay && screen === "settings" && (
+            <ConfigScreen onBack={goHome} onInputLockedChange={setInputLocked} inputBlocked={false} />
+          )}
+        </>
       )}
     </Shell>
   );
+}
+
+function renderOverlay(overlay: TuiOverlay, {
+  cwd,
+  onClose,
+  onFollowSession,
+  setInputLocked,
+  inputBlocked,
+}: {
+  cwd: string;
+  onClose: () => void;
+  onFollowSession: (session: SessionRecord, followUpText: string) => void;
+  setInputLocked: (locked: boolean) => void;
+  inputBlocked: boolean;
+}) {
+  if (overlay === "sessions") {
+    return (
+      <SessionsScreen
+        onBack={onClose}
+        onFollowUp={onFollowSession}
+        onInputLockedChange={setInputLocked}
+        inputBlocked={inputBlocked}
+      />
+    );
+  }
+  if (overlay === "capabilities") return <CapabilitiesScreen cwd={cwd} />;
+  if (overlay === "settings") {
+    return <ConfigScreen onBack={onClose} onInputLockedChange={setInputLocked} inputBlocked={inputBlocked} />;
+  }
+  return <TuiOverlayPanel overlay={overlay} cwd={cwd} onClose={onClose} />;
 }
 
 function normalizeScreen(screen: Screen): Screen {
@@ -270,9 +303,22 @@ function screenTitle(screen: Screen): string {
   return "Operator Console";
 }
 
+function screenTitleForOverlay(overlay: TuiOverlay): string {
+  if (overlay === "models") return "Models";
+  if (overlay === "sessions") return "Sessions";
+  if (overlay === "agents") return "Agents";
+  if (overlay === "tools") return "Tools";
+  if (overlay === "mcp") return "MCP";
+  if (overlay === "settings") return "Settings";
+  if (overlay === "capabilities") return "Capabilities";
+  if (overlay === "diff") return "Diff";
+  if (overlay === "help") return "Help";
+  return "Overlay";
+}
+
 function footerHints(screen: Screen, hasRun: boolean) {
-  if (screen === "launchpad") return [{ key: "j/k", label: "navigate fields" }, { key: "Enter", label: "edit/toggle" }, { key: "r", label: "run" }];
-  if (screen === "live-run") return [{ key: "[/]", label: "tabs" }, ...(hasRun ? [{ key: "f", label: "follow-up when done" }] : [])];
+  if (screen === "launchpad") return [{ key: "Enter", label: "send" }, { key: "Tab", label: "complete" }, { key: "Esc", label: "clear/close" }];
+  if (screen === "live-run") return [{ key: "[ ]", label: "tabs" }, ...(hasRun ? [{ key: "/", label: "commands" }, { key: "f/m", label: "message" }, { key: "c", label: "cancel run" }] : [])];
   return [{ key: "j/k", label: "navigate" }, { key: "b", label: "back" }];
 }
 
@@ -285,6 +331,10 @@ function toggleBrowserHeadless() {
       headless: !(cfg.browser?.headless ?? false),
     },
   });
+}
+
+function formatBackendLabel(backend: AgentBackend): string {
+  return backend === "custom" ? "runtime" : backend;
 }
 
 function continuationDomain(

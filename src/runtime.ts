@@ -96,6 +96,10 @@ export interface ToolDefinition<Input = unknown> {
   source: ToolSource;
   risk: ToolRisk;
   readOnly: boolean;
+  mutatesFiles?: boolean;
+  requiresCheckpoint?: boolean;
+  permissionCategory?: string;
+  evidenceType?: string;
   requiresConsent?: boolean;
   timeoutMs?: number;
   execute: (input: Input, context: ToolExecutionContext) => Promise<ToolResult> | ToolResult;
@@ -106,6 +110,7 @@ export interface SkillManifest {
   description: string;
   whenToUse?: string;
   allowedTools?: string[];
+  pathPatterns?: string[];
   model?: string;
   effort?: "low" | "medium" | "high" | "xhigh";
   disableModelInvocation?: boolean;
@@ -126,7 +131,48 @@ export interface PluginManifest {
     args?: string[];
     url?: string;
     env?: Record<string, string>;
+    headers?: Record<string, string>;
+    timeoutMs?: number;
+    toolFilter?: string[];
+    resourceFilter?: string[];
+    transport?: "auto" | "stdio" | "streamable-http" | "sse" | "http";
+    auth?: {
+      type?: "none" | "bearer" | "header" | "oauth" | "client_credentials";
+      tokenEnv?: string;
+      headerName?: string;
+      clientIdEnv?: string;
+      clientSecretEnv?: string;
+      scopes?: string[];
+      redirectUrl?: string;
+    };
+    disabled?: boolean;
   }>;
+  lspServers?: Record<string, {
+    command: string;
+    args?: string[];
+    env?: Record<string, string>;
+    extensions?: string[];
+    languages?: Record<string, string>;
+    languageId?: string;
+    initializationOptions?: unknown;
+  }>;
+  hooks?: Record<string, Array<{
+    matcher?: string;
+    hooks: Array<{
+      type?: "command" | "http" | "prompt";
+      command?: string;
+      url?: string;
+      prompt?: string;
+      model?: string;
+      timeoutMs?: number;
+      timeout?: number;
+      statusMessage?: string;
+      blocking?: boolean;
+      async?: boolean;
+      once?: boolean;
+      headers?: Record<string, string>;
+    }>;
+  }>>;
   configSchema?: unknown;
   activation?: {
     always?: boolean;

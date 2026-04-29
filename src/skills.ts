@@ -9,6 +9,7 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { SERVUS_DIR } from "./config.js";
+import { findServusProjectRoot } from "./coding-project.js";
 import type { SkillManifest } from "./runtime.js";
 
 const MAX_CANDIDATES_PER_ROOT = 200;
@@ -32,6 +33,11 @@ export interface LoadSkillsOptions {
   cwd: string;
   extraDirs?: string[];
   maxPromptChars?: number;
+}
+
+export interface SelectSkillsOptions {
+  limit?: number;
+  paths?: string[];
 }
 
 export function loadSkills(options: LoadSkillsOptions): SkillManifest[] {
@@ -58,11 +64,16 @@ export function loadSkills(options: LoadSkillsOptions): SkillManifest[] {
 export function selectSkillsForTask(
   task: string,
   skills: SkillManifest[],
-  limit = 5,
+  limitOrOptions: number | SelectSkillsOptions = 5,
 ): SkillManifest[] {
+  const options = typeof limitOrOptions === "number" ? { limit: limitOrOptions } : limitOrOptions;
+  const limit = options.limit ?? 5;
   const words = tokenize(task);
+  const paths = (options.paths ?? [])
+    .map(normalizePath)
+    .filter(Boolean);
   return skills
-    .map((skill) => ({ skill, score: scoreSkill(skill, words) }))
+    .map((skill) => ({ skill, score: scoreSkill(skill, words, paths) }))
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score || a.skill.name.localeCompare(b.skill.name))
     .slice(0, limit)
@@ -77,6 +88,7 @@ export function buildSkillsPrompt(skills: SkillManifest[], maxChars = DEFAULT_MA
       skill.description,
       skill.whenToUse ? `When to use: ${skill.whenToUse}` : "",
       skill.allowedTools?.length ? `Allowed tools: ${skill.allowedTools.join(", ")}` : "",
+      skill.pathPatterns?.length ? `Activates for paths: ${skill.pathPatterns.join(", ")}` : "",
       "",
       skill.body.trim(),
       "",
@@ -90,11 +102,12 @@ export function buildSkillsPrompt(skills: SkillManifest[], maxChars = DEFAULT_MA
 
 function skillRoots(cwd: string, extraDirs: string[] = []): SkillRoot[] {
   const srcDir = dirname(fileURLToPath(import.meta.url));
+  const projectRoot = findServusProjectRoot(cwd);
   return [
     { source: "bundled", root: join(srcDir, "skills") },
-    { source: "project", root: resolve(cwd, ".servus", "skills") },
+    { source: "project", root: resolve(projectRoot, ".servus", "skills") },
     { source: "user", root: join(SERVUS_DIR, "skills") },
-    { source: "plugin", root: resolve(cwd, ".servus", "plugins") },
+    { source: "plugin", root: resolve(projectRoot, ".servus", "plugins") },
     { source: "plugin", root: join(SERVUS_DIR, "plugins") },
     ...extraDirs.map((root) => ({
       source: root.startsWith(homedir()) ? "user" as const : "project" as const,
@@ -151,6 +164,10 @@ function readSkill(path: string, root: string, source: SkillSource): SkillManife
       description,
       whenToUse: stringValue(parsed.data.when_to_use) || stringValue(parsed.data.whenToUse),
       allowedTools: arrayValue(parsed.data.allowed_tools) || arrayValue(parsed.data.allowedTools),
+      pathPatterns: arrayValue(parsed.data.paths) ||
+        arrayValue(parsed.data.path_patterns) ||
+        arrayValue(parsed.data.pathPatterns) ||
+        arrayValue(parsed.data.globs),
       model: stringValue(parsed.data.model),
       effort: effortValue(parsed.data.effort),
       disableModelInvocation: booleanValue(parsed.data.disable_model_invocation),
@@ -221,7 +238,7 @@ function tokenize(text: string): Set<string> {
   return new Set(text.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 2));
 }
 
-function scoreSkill(skill: SkillManifest, words: Set<string>): number {
+function scoreSkill(skill: SkillManifest, words: Set<string>, paths: string[]): number {
   const haystack = tokenize([
     skill.name,
     skill.description,
@@ -230,6 +247,12 @@ function scoreSkill(skill: SkillManifest, words: Set<string>): number {
   let score = 0;
   for (const word of words) {
     if (haystack.has(word)) score++;
+  }
+  if (skill.pathPatterns?.length) {
+    const matchedPath = paths.some((path) =>
+      skill.pathPatterns!.some((pattern) => wildcardPathMatch(pattern, path))
+    );
+    if (matchedPath) score += 20;
   }
   return score;
 }
@@ -257,4 +280,54 @@ function safeRealpath(path: string): string | null {
 function isInside(root: string, child: string): boolean {
   const rel = relative(root, child);
   return rel === "" || (!!rel && !rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function normalizePath(value: string): string {
+  return value
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/#L\d+(?:-L?\d+)?$/i, "")
+    .replace(/:\d+(?:-\d+)?$/, "")
+    .trim();
+}
+
+function wildcardPathMatch(pattern: string, path: string): boolean {
+  const normalizedPattern = normalizePath(pattern);
+  const normalizedPath = normalizePath(path);
+  if (!normalizedPattern) return false;
+  if (normalizedPattern === normalizedPath) return true;
+  if (!/[?*]/.test(normalizedPattern)) {
+    return normalizedPath === normalizedPattern || normalizedPath.startsWith(`${normalizedPattern}/`);
+  }
+  const regex = new RegExp(`^${globToRegex(normalizedPattern)}$`);
+  return regex.test(normalizedPath);
+}
+
+function globToRegex(pattern: string): string {
+  let out = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const char = pattern[i];
+    const next = pattern[i + 1];
+    const afterNext = pattern[i + 2];
+    if (char === "*" && next === "*") {
+      if (afterNext === "/") {
+        out += "(?:.*/)?";
+        i += 2;
+      } else {
+        out += ".*";
+        i += 1;
+      }
+    } else if (char === "*") {
+      out += "[^/]*";
+    } else if (char === "?") {
+      out += "[^/]";
+    } else {
+      out += escapeRegexChar(char);
+    }
+  }
+  return out;
+}
+
+function escapeRegexChar(value: string): string {
+  return /[|\\{}()[\]^$+*?.]/.test(value) ? `\\${value}` : value;
 }

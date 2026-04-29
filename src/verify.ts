@@ -97,19 +97,17 @@ export interface VerificationResult {
 }
 
 function detectVerificationCommand(cwd: string): string {
-  const initSh = resolve(cwd, "init.sh");
-  if (existsSync(initSh)) return "bash init.sh";
-
   const pkgPath = resolve(cwd, "package.json");
   if (existsSync(pkgPath)) {
     try {
       const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
       const scripts = pkg.scripts ?? {};
+      const packageManager = inferPackageManager(cwd);
       const parts: string[] = [];
-      if (scripts.lint) parts.push("npm run lint");
-      if (scripts.typecheck) parts.push("npm run typecheck");
-      if (scripts.test) parts.push("npm run test");
-      if (scripts.build) parts.push("npm run build");
+      if (scripts.typecheck) parts.push(packageRunCommand(packageManager, "typecheck"));
+      if (scripts.lint) parts.push(packageRunCommand(packageManager, "lint"));
+      if (scripts.test) parts.push(packageRunCommand(packageManager, "test"));
+      if (scripts.build) parts.push(packageRunCommand(packageManager, "build"));
       if (parts.length > 0) return parts.join(" && ");
     } catch {
       /* fall through */
@@ -122,6 +120,20 @@ function detectVerificationCommand(cwd: string): string {
   if (existsSync(resolve(cwd, "pyproject.toml"))) return "python -m pytest";
 
   return 'echo "No verification command detected — treating as pass"';
+}
+
+function inferPackageManager(cwd: string): string {
+  if (existsSync(resolve(cwd, "pnpm-lock.yaml"))) return "pnpm";
+  if (existsSync(resolve(cwd, "yarn.lock"))) return "yarn";
+  if (existsSync(resolve(cwd, "bun.lockb"))) return "bun";
+  return "npm";
+}
+
+function packageRunCommand(packageManager: string, script: string): string {
+  if (packageManager === "yarn") return `yarn ${script}`;
+  if (packageManager === "pnpm") return `pnpm run ${script}`;
+  if (packageManager === "bun") return `bun run ${script}`;
+  return `npm run ${script}`;
 }
 
 export async function runVerification(

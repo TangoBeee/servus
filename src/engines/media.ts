@@ -10,9 +10,8 @@ import { log, ANSI, formatDuration } from "../log.js";
 import { bus } from "../events.js";
 import { createMediaToolsWithContext } from "../tools-media.js";
 import type { Engine, EngineContext, EngineResult } from "../engine.js";
-import { detectClarificationRequest, stripProtocolTags } from "../clarification.js";
 import { SERVUS_OPERATING_LOOP } from "../prompts/operating-loop.js";
-import { resultFromValidatedResponse } from "../agentic-loop.js";
+import { runDomainWorkflowRuntime } from "../domain-workflow-runtime.js";
 
 // ─── Media System Prompt ────────────────────────────────────────────────────
 
@@ -35,10 +34,12 @@ ${SERVUS_OPERATING_LOOP}
 2. **Video/Audio Information**
    - Use \`video_info\` to get metadata about an online video without downloading it
    - Use \`media_info\` to inspect local media files (codec, resolution, duration, bitrate)
+   - Use \`media_presets\`, \`media_plan_job\`, and \`media_batch_plan\` to plan outputs safely
 
 3. **Format Conversion**
    - Use \`convert_media\` to convert between formats (e.g. mp4→mp3, wav→flac, mkv→mp4)
    - Use \`trim_media\`, \`compress_media\`, \`extract_audio\`, and \`thumbnail\`
+   - Use \`media_progress_summary\` to summarize long ffmpeg/yt-dlp logs for the user
    - Can trim, resize, re-encode, compress, extract audio, and create thumbnails
 
 4. **File Operations**
@@ -93,6 +94,7 @@ export class MediaEngine implements Engine {
         role: "media-handler",
         color: ANSI.magenta,
         model: ctx.model,
+        domain: "media",
         prompt: MEDIA_PROMPT,
         extraTools: mediaTools as Record<string, unknown>,
         disallowedTools: ["bash", "write", "edit", "patch", "webfetch"],
@@ -103,8 +105,19 @@ export class MediaEngine implements Engine {
 
       this.emitStatus("working");
 
-      const response = await this.agent.send(
-        [
+      const result = await runDomainWorkflowRuntime({
+        agent: this.agent,
+        ctx,
+        domain: "media",
+        progressRequired: true,
+        plan: [
+          "Check media prerequisites and inspect inputs.",
+          "Plan outputs, presets, and overwrite safety before long jobs.",
+          "Run the requested operation and summarize progress.",
+          "Verify artifact existence, size, and metadata.",
+        ],
+        evidenceTypes: ["media_probe", "media_job", "conversion_result", "download_result"],
+        initialMessage: [
           "## Media Task",
           ctx.task,
           "",
@@ -117,51 +130,21 @@ export class MediaEngine implements Engine {
           "Complete this task using servus_done with file/artifact evidence.",
           "If required user details are missing and you cannot proceed, call servus_need_input and ask only the necessary question.",
         ].join("\n"),
-      );
-
-      this.emitStatus("done");
-
-      const cost = this.agent.cost;
+      });
       const elapsed = Date.now() - startTime;
-      const clarification = detectClarificationRequest(response.text, ctx.task);
-      const cleaned = stripProtocolTags(response.text);
-      const finalized = resultFromValidatedResponse(ctx, "media", response);
-      if (finalized) {
-        this.emitStatus(finalized.needsInput ? "waiting_input" : finalized.success ? "done" : "error");
-        return finalized;
-      }
-
-      if (clarification) {
+      if (result.needsInput) {
         log.warn("Media task is waiting for user input.");
-        return {
-          success: false,
-          needsInput: true,
-          summary: clarification.message,
-          question: clarification.message,
-          questions: clarification.questions,
-          questionContext: clarification.context,
-          clarification,
-          cost,
-          error: "Needs user input",
-        };
+        this.emitStatus("waiting_input");
+        return result;
       }
-
-      if (response.text.includes("<task_status>DONE</task_status>")) {
+      if (result.success) {
         log.success("Media task completed in " + formatDuration(elapsed));
-        return {
-          success: true,
-          summary: cleaned,
-          cost,
-        };
+        this.emitStatus("done");
+        return result;
       }
 
-      log.warn("Media agent did not signal completion.");
-      return {
-        success: false,
-        summary: "Media agent did not complete the task within the allowed turns.",
-        cost,
-        error: "Agent did not signal DONE",
-      };
+      this.emitStatus("error");
+      return result;
     } catch (err) {
       this.emitStatus("error");
       return {

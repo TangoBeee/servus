@@ -51,7 +51,7 @@ const FIELDS: Field[] = [
   { id: "memory.enabled", group: "Memory", label: "Memory Enabled", kind: "toggle" },
 ];
 
-const BACKENDS: ServusConfig["defaultBackend"][] = ["auto", "claude-code", "custom"];
+const BACKENDS: ServusConfig["defaultBackend"][] = ["auto", "custom"];
 
 export function ConfigScreen({ onBack, onInputLockedChange, inputBlocked = false }: Props) {
   const [config, setConfig] = useState(loadConfig);
@@ -76,9 +76,9 @@ export function ConfigScreen({ onBack, onInputLockedChange, inputBlocked = false
         setModelPickerOpen(false);
         return;
       }
-      if (key.upArrow || input === "k") setModelSelected((value) => Math.max(0, value - 1));
-      if (key.downArrow || input === "j" || input === "\t" || key.tab) {
-        setModelSelected((value) => Math.min(models.length, value + 1));
+      if (key.upArrow || input.includes("k")) setModelSelected((value) => Math.max(0, value - countChar(input, "k")));
+      if (key.downArrow || input.includes("j") || input === "\t" || key.tab) {
+        setModelSelected((value) => Math.min(models.length, value + countChar(input, "j")));
       }
       if (input === "c") {
         setModelPickerOpen(false);
@@ -107,8 +107,8 @@ export function ConfigScreen({ onBack, onInputLockedChange, inputBlocked = false
       return;
     }
     if (key.escape || input === "b" || input === "q") onBack();
-    if (key.upArrow || input === "k") setSelected((value) => Math.max(0, value - 1));
-    if (key.downArrow || input === "j" || input === "\t" || key.tab) setSelected((value) => Math.min(FIELDS.length - 1, value + 1));
+    if (key.upArrow || input.includes("k")) setSelected((value) => Math.max(0, value - countChar(input, "k")));
+    if (key.downArrow || input.includes("j") || input === "\t" || key.tab) setSelected((value) => Math.min(FIELDS.length - 1, value + countChar(input, "j")));
     if (key.return || input === "e") activate(FIELDS[selected]);
   }, { isActive: !inputBlocked });
 
@@ -183,8 +183,8 @@ export function ConfigScreen({ onBack, onInputLockedChange, inputBlocked = false
                   {editing === field.id ? (
                     <TextInput value={editValue} onChange={setEditValue} onSubmit={saveEdit} />
                   ) : (
-                    <Text color={field.id === "defaultModel" ? COLORS.secondary : "gray"}>
-                      {formatValue(getValue(config, field.id))}
+	                    <Text color={field.id === "defaultModel" ? COLORS.secondary : "gray"}>
+	                      {formatValue(getValue(config, field.id), field.id)}
                     </Text>
                   )}
                 </Box>
@@ -214,6 +214,11 @@ export function ConfigScreen({ onBack, onInputLockedChange, inputBlocked = false
   );
 }
 
+function countChar(value: string, char: string): number {
+  const count = [...value].filter((item) => item === char).length;
+  return Math.max(1, count);
+}
+
 function getValue(config: ServusConfig, field: FieldId): unknown {
   if (field === "browser.headless") return config.browser?.headless ?? false;
   if (field === "browser.timeoutMs") return config.browser?.timeoutMs ?? 30_000;
@@ -234,7 +239,7 @@ function setValue(config: ServusConfig, field: FieldId, value: unknown): ServusC
   return next;
 }
 
-function formatValue(value: unknown): string {
+function formatValue(value: unknown, field?: FieldId): string {
   if (value === undefined || value === "") return "(not set)";
   if (typeof value === "boolean") return value ? "enabled" : "disabled";
   return String(value);

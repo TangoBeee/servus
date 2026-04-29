@@ -1,12 +1,14 @@
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
 import { getApiKeyStatus, loadConfig } from "./config.js";
+import { listMcpServerStatuses, resolveMcpServers } from "./mcp-client.js";
 import { loadPlugins } from "./plugins.js";
 import { loadSkills } from "./skills.js";
 import {
   DATA_TOOL_METADATA,
   DESKTOP_TOOL_METADATA,
   EXTENSION_TOOL_METADATA,
+  GENERAL_TOOL_METADATA,
   MEDIA_TOOL_METADATA,
   SECURITY_TOOL_METADATA,
 } from "./tool-metadata.js";
@@ -63,12 +65,15 @@ export const EXTENSION_TOOLS = EXTENSION_TOOL_METADATA.map((tool) => tool.name);
 
 export const SECURITY_TOOLS = SECURITY_TOOL_METADATA.map((tool) => tool.name);
 
+export const GENERAL_TOOLS = GENERAL_TOOL_METADATA.map((tool) => tool.name);
+
 export function getCapabilityDescriptors(cwd: string): CapabilityDescriptor[] {
   const cfg = loadConfig();
   const keys = getApiKeyStatus();
   const skills = loadSkills({ cwd, extraDirs: cfg.skills?.dirs });
   const plugins = loadPlugins({ cwd, extraDirs: cfg.plugins?.dirs, disabled: cfg.plugins?.disabled });
-  const mcpCount = Object.keys(cfg.mcpServers ?? {}).length;
+  const mcpServers = resolveMcpServers(cwd);
+  const enabledMcpServers = mcpServers.filter((server) => !server.config.disabled);
   const mediaMissing = ["yt-dlp", "ffmpeg", "ffprobe"].filter((command) => !commandAvailable(command));
   const desktopMissing = desktopMissingDependencies();
   const dataMissing = ["unpdf", "mammoth", "csv-parse", "node-xlsx"].filter((pkg) => !packageAvailable(pkg));
@@ -132,6 +137,18 @@ export function getCapabilityDescriptors(cwd: string): CapabilityDescriptor[] {
       ],
     },
     {
+      id: "general",
+      title: "General",
+      status: "ready",
+      tools: GENERAL_TOOLS,
+      dependencies: [],
+      missing: [],
+      notes: [
+        "Direct answers with explicit basis",
+        "Routes tool-backed tasks to the right Servus domain",
+      ],
+    },
+    {
       id: "security",
       title: "Cyber Security",
       status: "ready",
@@ -174,13 +191,67 @@ export function getCapabilityDescriptors(cwd: string): CapabilityDescriptor[] {
     {
       id: "mcp",
       title: "MCP",
-      status: mcpCount ? "configured" : "empty",
+      status: enabledMcpServers.length ? "configured" : "empty",
       tools: [],
-      dependencies: [],
+      dependencies: enabledMcpServers.map((server) => server.name),
       missing: [],
-      notes: [`${mcpCount} configured servers`, "stdio/http client pending"],
+      notes: [
+        `${enabledMcpServers.length} enabled / ${mcpServers.length} configured servers`,
+        "stdio + streamable HTTP client available",
+        "External MCP tools require approval by default",
+      ],
     },
   ];
+}
+
+export async function getCapabilityDescriptorsWithLiveMcp(cwd: string): Promise<CapabilityDescriptor[]> {
+  const descriptors = getCapabilityDescriptors(cwd);
+  const index = descriptors.findIndex((capability) => capability.id === "mcp");
+  if (index === -1) return descriptors;
+  const mcpServers = resolveMcpServers(cwd);
+  const enabledMcpServers = mcpServers.filter((server) => !server.config.disabled);
+  if (!enabledMcpServers.length) return descriptors;
+
+  try {
+    const statuses = await listMcpServerStatuses(cwd);
+    const ready = statuses.filter((status) => status.status === "ready");
+    const authRequired = statuses.filter((status) => status.status === "auth_required");
+    const errors = statuses.filter((status) => status.status === "error");
+    const totalTools = statuses.reduce((sum, status) => sum + status.tools, 0);
+    const totalResources = statuses.reduce((sum, status) => sum + status.resources, 0);
+    const totalPrompts = statuses.reduce((sum, status) => sum + (status.prompts ?? 0), 0);
+    descriptors[index] = {
+      id: "mcp",
+      title: "MCP",
+      status: ready.length
+        ? "ready"
+        : authRequired.length
+          ? "configured"
+          : errors.length
+            ? "degraded"
+            : "configured",
+      tools: [],
+      dependencies: enabledMcpServers.map((server) => server.name),
+      missing: errors.map((status) => status.name),
+      notes: [
+        `${ready.length}/${enabledMcpServers.length} ready`,
+        `${totalTools} tools · ${totalResources} resources · ${totalPrompts} prompts`,
+        authRequired.length ? `Auth needed: ${authRequired.map((status) => status.name).join(", ")}` : "Auth OK or not required",
+        errors.length ? `Errors: ${errors.map((status) => status.name).join(", ")}` : "stdio, Streamable HTTP, and SSE supported",
+      ],
+    };
+  } catch (err) {
+    descriptors[index] = {
+      ...descriptors[index]!,
+      status: "degraded",
+      missing: ["mcp health check"],
+      notes: [
+        `${enabledMcpServers.length} configured servers`,
+        `Health check failed: ${err instanceof Error ? err.message : String(err)}`,
+      ],
+    };
+  }
+  return descriptors;
 }
 
 function commandAvailable(command: string): boolean {

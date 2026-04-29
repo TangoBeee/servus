@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import TextInput from "ink-text-input";
-import { KeyHints } from "../components/key-hints.js";
 import { COLORS, ICONS } from "../theme.js";
 import { listSessions, deleteSession, type SessionRecord } from "../../session-store.js";
 import { formatDuration } from "../../log.js";
@@ -38,8 +37,8 @@ export function SessionsScreen({ onBack, onFollowUp, onInputLockedChange, inputB
 
     if (viewing) {
       if (key.escape || input === "q") setViewing(null);
-      if (key.upArrow || input === "k") setLogScroll((s) => Math.max(0, s - 1));
-      if (key.downArrow || input === "j") setLogScroll((s) => s + 1);
+      if (key.upArrow || input.includes("k")) setLogScroll((s) => Math.max(0, s - countChar(input, "k")));
+      if (key.downArrow || input.includes("j")) setLogScroll((s) => s + countChar(input, "j"));
       if (input === "f" && onFollowUp && viewing) {
         setShowFollowUp(true);
       }
@@ -47,8 +46,8 @@ export function SessionsScreen({ onBack, onFollowUp, onInputLockedChange, inputB
     }
 
     if (key.escape || input === "q") onBack();
-    else if (key.upArrow || input === "k") setSelected((s) => Math.max(0, s - 1));
-    else if (key.downArrow || input === "j") setSelected((s) => Math.min(sessions.length - 1, s + 1));
+    else if (key.upArrow || input.includes("k")) setSelected((s) => Math.max(0, s - countChar(input, "k")));
+    else if (key.downArrow || input.includes("j")) setSelected((s) => Math.min(sessions.length - 1, s + countChar(input, "j")));
     else if (key.return) {
       if (sessions[selected]) setViewing(sessions[selected]);
     } else if (input === "d") {
@@ -94,18 +93,14 @@ export function SessionsScreen({ onBack, onFollowUp, onInputLockedChange, inputB
             placeholder="e.g. refine implementation, add dark mode, update tests..."
           />
         </Box>
-        <KeyHints
-          hints={[
-            { key: "Enter", label: "run follow-up" },
-            { key: "Esc", label: "cancel (letters type into prompt)" },
-          ]}
-        />
+        <Text color="gray">Enter run follow-up · Esc cancel · letters type into prompt</Text>
       </Box>
     );
   }
 
   if (viewing) {
-    const visible = viewing.logs.slice(logScroll, logScroll + 20);
+    const timeline = sessionTimeline(viewing);
+    const visible = timeline.slice(logScroll, logScroll + 20);
     return (
       <Box flexDirection="column">
         <Text color={COLORS.primary} bold>Session {viewing.id}</Text>
@@ -114,9 +109,24 @@ export function SessionsScreen({ onBack, onFollowUp, onInputLockedChange, inputB
             {viewing.task}
           </Text>
           <Text color="gray">
-            {new Date(viewing.startTime).toLocaleString()} | {viewing.model} |{" "}
-            {viewing.status}
+            {new Date(viewing.startTime).toLocaleString()} | {viewing.domain ?? "auto"} | {viewing.model} |{" "}
+            {viewing.status}{viewing.runtimeStatus ? `/${viewing.runtimeStatus}` : ""}
           </Text>
+          <Text color="gray" wrap="truncate">
+            Target: {viewing.targetCwd ?? viewing.cwd}
+          </Text>
+          {viewing.finalSummary && (
+            <Box flexDirection="column" marginTop={1}>
+              <Text color={COLORS.secondary} bold>Final Summary</Text>
+              <Text color="white" wrap="wrap">{viewing.finalSummary}</Text>
+            </Box>
+          )}
+          <Box marginTop={1} gap={2}>
+            <Text color="gray">Events: {viewing.events?.length ?? 0}</Text>
+            <Text color="gray">Evidence: {viewing.evidence?.length ?? 0}</Text>
+            <Text color="gray">Artifacts: {viewing.artifacts?.length ?? 0}</Text>
+            <Text color="gray">Cost: ${viewing.cost.toFixed(4)}</Text>
+          </Box>
         </Box>
         <Box
           flexDirection="column"
@@ -132,27 +142,23 @@ export function SessionsScreen({ onBack, onFollowUp, onInputLockedChange, inputB
           ))}
           {visible.length === 0 && (
             <Text color="gray" italic>
-              No logs recorded for this session.
+              No timeline entries recorded for this session.
             </Text>
           )}
         </Box>
         {onFollowUp && (
           <Box paddingX={1} marginTop={1}>
             <Text color="gray">
-              Press <Text color="green" bold>[f]</Text> to continue this run with follow-up feedback or new features.
+              Press <Text color="green" bold>[f]</Text> to continue this run in the same session.
             </Text>
           </Box>
         )}
-        <KeyHints
-          hints={[
-            ...(onFollowUp ? [{ key: "f", label: "follow-up (continue from this run)" }] : []),
-            { key: "j/k", label: "scroll" },
-            { key: "Esc", label: "back" },
-          ]}
-        />
+        <Text color="gray">{onFollowUp ? "f follow-up · " : ""}j/k scroll · Esc back</Text>
       </Box>
     );
   }
+
+  const sessionOffset = sessionOffsetFor(selected, sessions.length);
 
   return (
     <Box flexDirection="column">
@@ -175,13 +181,15 @@ export function SessionsScreen({ onBack, onFollowUp, onInputLockedChange, inputB
             <Text color="gray" bold>
               {"  "}
               {"ID".padEnd(10)}
-              {"Task".padEnd(35)}
+              {"Task / Summary".padEnd(35)}
+              {"Domain".padEnd(10)}
               {"Status".padEnd(12)}
               {"Duration".padEnd(10)}
               {"Cost".padEnd(10)}
             </Text>
           </Box>
-          {sessions.slice(0, 20).map((s, i) => {
+          {sessions.slice(sessionOffset, sessionOffset + sessionPageSize).map((s, localIndex) => {
+            const i = sessionOffset + localIndex;
             const dur = s.endTime
               ? formatDuration(s.endTime - s.startTime)
               : s.status === "waiting_input"
@@ -197,7 +205,8 @@ export function SessionsScreen({ onBack, onFollowUp, onInputLockedChange, inputB
                   bold={i === selected}
                 >
                   {s.id.padEnd(10)}
-                  {s.task.slice(0, 33).padEnd(35)}
+                  {sessionLabel(s).slice(0, 33).padEnd(35)}
+                  {(s.domain ?? "auto").slice(0, 9).padEnd(10)}
                   {(s.status === "completed"
                     ? `${ICONS.check} done`
                     : s.status === "failed"
@@ -216,14 +225,47 @@ export function SessionsScreen({ onBack, onFollowUp, onInputLockedChange, inputB
       )}
 
       <Text> </Text>
-      <KeyHints
-        hints={[
-          { key: "Enter", label: "view logs (then [f] for follow-up)" },
-          { key: "d", label: "delete" },
-          { key: "j/k", label: "navigate" },
-          { key: "Esc", label: "back" },
-        ]}
-      />
+      <Text color="gray">Enter view · f follow-up after opening · d delete · j/k navigate · Esc back</Text>
     </Box>
   );
+}
+
+const sessionPageSize = 18;
+
+function sessionOffsetFor(selected: number, total: number): number {
+  return Math.max(0, Math.min(selected - sessionPageSize + 1, Math.max(0, total - sessionPageSize)));
+}
+
+function countChar(value: string, char: string): number {
+  const count = [...value].filter((item) => item === char).length;
+  return Math.max(1, count);
+}
+
+function sessionLabel(session: SessionRecord): string {
+  const finalLine = session.finalSummary
+    ?.split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  return finalLine || session.task;
+}
+
+function sessionTimeline(session: SessionRecord): string[] {
+  const logs = session.logs ?? [];
+  const eventLines = (session.events ?? [])
+    .slice(-160)
+    .map((event) => `[${event.agent ?? "servus"}] ${event.type}: ${event.message}`)
+    .filter(Boolean);
+  const evidenceLines = (session.evidence ?? [])
+    .slice(-40)
+    .map((item) => `[evidence:${item.type}] ${item.summary}`);
+  const artifactLines = (session.artifacts ?? [])
+    .slice(-20)
+    .map((item) => `[artifact] ${item}`);
+  return [
+    ...(session.finalSummary ? [`[final] ${session.finalSummary}`] : []),
+    ...eventLines,
+    ...evidenceLines,
+    ...artifactLines,
+    ...logs,
+  ].filter((line, index, all) => line.trim() && all.indexOf(line) === index);
 }

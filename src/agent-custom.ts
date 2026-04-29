@@ -18,9 +18,11 @@ import {
 } from "ai";
 import type { LanguageModel } from "ai";
 import type { IAgent, AgentConfig, AgentResponse, AgentFinalization, AgentToolEvent } from "./agent.js";
-import { resolveModel } from "./provider.js";
+import type { TaskDomain } from "./engine.js";
+import { pricingForModel, resolveModel } from "./provider.js";
 import { createTools } from "./tools.js";
 import { createFinishTools } from "./tools-finish.js";
+import { wrapToolSetWithRegistry } from "./ai-tool-registry-adapter.js";
 import { log, ANSI } from "./log.js";
 import { bus } from "./events.js";
 import { loadConfig } from "./config.js";
@@ -33,6 +35,15 @@ import {
   shouldCompactContext,
   estimateMessageTokens,
 } from "./context-manager.js";
+import {
+  loadCodingSettings,
+  runCodingHooks,
+  type CodingHookEvent,
+  type CodingHookRunResult,
+  type CodingSettings,
+} from "./coding-settings.js";
+import { loadPlugins, selectPluginsForTask } from "./plugins.js";
+import type { PluginManifest } from "./runtime.js";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -40,6 +51,12 @@ const MAX_STEPS = 100;
 const MAX_HISTORY = 80;
 const RATE_LIMIT_RETRIES = 3;
 const RATE_LIMIT_DELAY_MS = 8000;
+
+type AiToolLike = {
+  description?: string;
+  inputSchema?: unknown;
+  execute?: (input: unknown, options?: { abortSignal?: AbortSignal }) => Promise<unknown> | unknown;
+};
 
 // ─── Custom Agent ───────────────────────────────────────────────────────────
 
@@ -55,13 +72,17 @@ export class CustomAgent implements IAgent {
   private history: ModelMessage[] = [];
   private tools: ToolSet;
   private cwd: string;
+  private domain: TaskDomain;
   private skills: SkillManifest[] = [];
+  private plugins: PluginManifest[] = [];
+  private activePlugins: PluginManifest[] = [];
   private maxSkillsPromptChars: number;
   private totalCost = 0;
   private totalTokens = { input: 0, output: 0 };
   private sessionId?: string;
   private finalization?: AgentFinalization;
   private toolEvents: AgentToolEvent[] = [];
+  private settings: CodingSettings;
 
   constructor(config: AgentConfig, cwd: string) {
     this.name = config.name;
@@ -70,6 +91,8 @@ export class CustomAgent implements IAgent {
     this.systemPrompt = config.prompt;
     this.cwd = cwd;
     this.sessionId = config.sessionId;
+    this.domain = config.domain ?? inferDomainFromAgent(config.name, config.role);
+    this.settings = loadCodingSettings(cwd);
 
     const servusConfig = loadConfig();
     this.maxSkillsPromptChars = servusConfig.skills?.maxPromptChars ?? 24_000;
@@ -88,6 +111,31 @@ export class CustomAgent implements IAgent {
         });
       }
     }
+    if (servusConfig.plugins?.enabled !== false) {
+      this.plugins = loadPlugins({
+        cwd,
+        extraDirs: servusConfig.plugins?.dirs,
+        disabled: servusConfig.plugins?.disabled,
+      });
+      this.activePlugins = selectPluginsForTask("", this.domain, this.plugins);
+      if (this.plugins.length > 0) {
+        bus.push({
+          type: "plugin:load",
+          agent: this.name,
+          message: `${this.plugins.length} plugin manifests available`,
+          metadata: {
+            count: this.plugins.length,
+            activeCount: this.activePlugins.length,
+            domain: this.domain,
+            plugins: this.plugins.map((plugin) => ({
+              id: plugin.id,
+              version: plugin.version,
+              active: this.activePlugins.some((active) => active.id === plugin.id),
+            })),
+          },
+        });
+      }
+    }
 
     const resolved = resolveModel(config.model);
     this.model = resolved.model;
@@ -95,16 +143,27 @@ export class CustomAgent implements IAgent {
     this.modelId = resolved.modelId;
     this.history = loadAgentHistory(this.sessionId, this.name);
 
-    this.tools = {
-      ...createTools(cwd),
+    const rawTools = {
+      ...createTools(cwd, { sessionId: this.sessionId, agentName: this.name }),
       ...(config.extraTools ?? {}),
       ...createFinishTools((finalization) => {
         this.finalization = finalization;
-      }),
+      }, { agentName: this.name, color: this.color }),
     } as ToolSet;
-    for (const name of config.disallowedTools ?? []) {
-      delete (this.tools as Record<string, unknown>)[name];
+    for (const name of expandDisallowedToolNames(config.disallowedTools ?? [])) {
+      delete (rawTools as Record<string, unknown>)[name];
     }
+    this.tools = wrapToolSetWithRegistry(
+      wrapToolSetWithAgentHooks(rawTools, {
+        cwd,
+        agentName: this.name,
+        sessionId: this.sessionId,
+        settings: this.settings,
+      }),
+      cwd,
+    );
+
+    void this.runLifecycleHooks("SessionStart");
 
     log.agent(
       this.name,
@@ -116,6 +175,24 @@ export class CustomAgent implements IAgent {
   async send(message: string): Promise<AgentResponse> {
     this.finalization = undefined;
     this.toolEvents = [];
+    const promptHooks = await this.runLifecycleHooks("UserPromptSubmit", {
+      toolInput: { message },
+    });
+    const promptBlock = blockedHookResult(promptHooks);
+    if (promptBlock) {
+      const text = `Blocked by Servus hook: ${summarizeHookBlock(promptBlock)}`;
+      this.history.push({ role: "user" as const, content: message });
+      this.history.push({ role: "assistant" as const, content: text });
+      this.persistHistory();
+      return {
+        text,
+        cost: this.totalCost,
+        turns: 0,
+        subtype: "blocked_by_hook",
+        finalization: this.finalization,
+        toolEvents: this.toolEvents,
+      };
+    }
     this.history.push({ role: "user" as const, content: message });
     await this.compactIfNeeded("before_send", message);
     this.sanitizeHistoryForProvider("before_send");
@@ -182,6 +259,7 @@ export class CustomAgent implements IAgent {
         switch (part.type) {
           case "text-delta":
             totalText += part.text;
+            emitAssistantDelta(this.name, this.color, part.text);
             log.agentText(this.name, this.color, part.text);
             break;
 
@@ -244,7 +322,7 @@ export class CustomAgent implements IAgent {
               agent: this.name,
               color: this.color,
               message: preview || "done",
-              metadata: { output: raw.slice(0, 1000) },
+              metadata: { tool: toolName ?? "unknown", output: raw.slice(0, 1000) },
             });
             if (bus.interactive) {
               bus.push({
@@ -362,6 +440,10 @@ export class CustomAgent implements IAgent {
         await this.compactIfNeeded("stream_rate_limit", message, true);
         this.sanitizeHistoryForProvider("stream_rate_limit");
         this.persistHistory();
+        await this.runLifecycleHooks("StopFailure", {
+          toolOutput: `Rate limit / token cap hit: ${msg}`,
+          isError: true,
+        });
         return {
           text: `Rate limit / token cap hit: ${msg}`,
           cost: this.totalCost,
@@ -380,6 +462,10 @@ export class CustomAgent implements IAgent {
             "[Agent notice: model/tool stream protocol error. Servus sanitized tool history and the run can be resumed in the same session.]",
         });
         this.persistHistory();
+        await this.runLifecycleHooks("StopFailure", {
+          toolOutput: `Transient model/tool stream error: ${stripInternalErrorPrefix(msg)}`,
+          isError: true,
+        });
         return {
           text: `Transient model/tool stream error: ${stripInternalErrorPrefix(msg)}`,
           cost: this.totalCost,
@@ -395,6 +481,10 @@ export class CustomAgent implements IAgent {
         content: `[Agent error: ${msg}]`,
       });
       this.persistHistory();
+      await this.runLifecycleHooks("StopFailure", {
+        toolOutput: `Error: ${msg}`,
+        isError: true,
+      });
 
       return {
         text: `Error: ${msg}`,
@@ -421,6 +511,9 @@ export class CustomAgent implements IAgent {
     await this.compactIfNeeded("after_send", message);
     this.sanitizeHistoryForProvider("after_send");
     this.persistHistory();
+    await this.runLifecycleHooks("Stop", {
+      toolOutput: totalText,
+    });
 
     return {
       text: totalText,
@@ -442,22 +535,77 @@ export class CustomAgent implements IAgent {
   }
 
   private buildSystemPrompt(message: string): string {
-    if (this.skills.length === 0) return this.systemPrompt;
+    const sections = [this.systemPrompt];
+
+    if (this.plugins.length > 0) {
+      const selectedPlugins = selectPluginsForTask(message, this.domain, this.plugins);
+      this.activePlugins = selectedPlugins;
+      const pluginsPrompt = buildPluginsPrompt(selectedPlugins);
+      if (pluginsPrompt) {
+        sections.push(
+          "",
+          "# Active Servus Plugins",
+          "These local plugin manifests are active for this task/domain. Plugin MCP servers are available through the Servus MCP tools when configured.",
+          "",
+          pluginsPrompt,
+        );
+      }
+    }
+
+    if (this.skills.length === 0) return sections.join("\n");
 
     const selected = selectSkillsForTask(message, this.skills);
-    if (selected.length === 0) return this.systemPrompt;
+    if (selected.length === 0) return sections.join("\n");
 
     const skillsPrompt = buildSkillsPrompt(selected, this.maxSkillsPromptChars);
-    if (!skillsPrompt) return this.systemPrompt;
+    if (!skillsPrompt) return sections.join("\n");
 
-    return [
-      this.systemPrompt,
+    sections.push(
       "",
       "# Relevant Servus Skills",
       "Use these local skills when they match the current task. Respect each skill's allowed tools.",
       "",
       skillsPrompt,
-    ].join("\n");
+    );
+    return sections.join("\n");
+  }
+
+  private async runLifecycleHooks(
+    event: CodingHookEvent,
+    extra: Partial<{
+      toolName: string;
+      toolInput: unknown;
+      toolOutput: string;
+      isError: boolean;
+    }> = {},
+  ): Promise<CodingHookRunResult[]> {
+    const results = await runCodingHooks(this.settings, event, {
+      event,
+      cwd: this.cwd,
+      agentName: this.name,
+      sessionId: this.sessionId,
+      ...extra,
+    });
+    if (results.length > 0) {
+      bus.push({
+        type: "agent:hook",
+        agent: this.name,
+        color: this.color,
+        message: `${event}: ${results.length} hook${results.length === 1 ? "" : "s"}`,
+        metadata: {
+          event,
+          blocked: results.some((result) => result.blocked),
+          results: results.map((result) => ({
+            ok: result.ok,
+            blocked: result.blocked,
+            source: result.source,
+            durationMs: result.durationMs,
+            output: result.output.slice(0, 2000),
+          })),
+        },
+      });
+    }
+    return results;
   }
 
   private async compactIfNeeded(reason: string, currentMessage: string, force = false): Promise<void> {
@@ -578,6 +726,147 @@ export class CustomAgent implements IAgent {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+function wrapToolSetWithAgentHooks(
+  tools: ToolSet,
+  context: {
+    cwd: string;
+    agentName: string;
+    sessionId?: string;
+    settings: CodingSettings;
+  },
+): ToolSet {
+  const wrapped: Record<string, unknown> = {};
+
+  for (const [name, rawTool] of Object.entries(tools as Record<string, unknown>)) {
+    if (!isAiToolLike(rawTool)) {
+      wrapped[name] = rawTool;
+      continue;
+    }
+
+    wrapped[name] = {
+      ...rawTool,
+      execute: async (input: unknown, options?: { abortSignal?: AbortSignal }) => {
+        const pre = await runCodingHooks(context.settings, "PreToolUse", {
+          event: "PreToolUse",
+          cwd: context.cwd,
+          agentName: context.agentName,
+          sessionId: context.sessionId,
+          toolName: name,
+          toolInput: input,
+        });
+        const blocked = blockedHookResult(pre);
+        if (blocked) {
+          return `Error: blocked by Servus hook before ${name}: ${summarizeHookBlock(blocked)}`;
+        }
+
+        try {
+          const output = await rawTool.execute!(input, options);
+          await runCodingHooks(context.settings, "PostToolUse", {
+            event: "PostToolUse",
+            cwd: context.cwd,
+            agentName: context.agentName,
+            sessionId: context.sessionId,
+            toolName: name,
+            toolInput: input,
+            toolOutput: summarizeToolOutput(output).slice(0, 20_000),
+          });
+          return output;
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          await runCodingHooks(context.settings, "PostToolUseFailure", {
+            event: "PostToolUseFailure",
+            cwd: context.cwd,
+            agentName: context.agentName,
+            sessionId: context.sessionId,
+            toolName: name,
+            toolInput: input,
+            toolOutput: message,
+            isError: true,
+          });
+          throw err;
+        }
+      },
+    };
+  }
+
+  return wrapped as ToolSet;
+}
+
+function isAiToolLike(value: unknown): value is AiToolLike {
+  return typeof value === "object" &&
+    value !== null &&
+    typeof (value as AiToolLike).execute === "function" &&
+    "inputSchema" in value;
+}
+
+function blockedHookResult(results: CodingHookRunResult[]): CodingHookRunResult | undefined {
+  return results.find((result) => result.blocked);
+}
+
+function summarizeHookBlock(result: CodingHookRunResult): string {
+  const output = result.output.trim();
+  if (output) return output.slice(0, 1000);
+  return `${result.event} hook from ${result.source} returned a blocking result`;
+}
+
+function inferDomainFromAgent(name: string, role: string): TaskDomain {
+  const text = `${name} ${role}`.toLowerCase();
+  if (text.includes("browser")) return "browser";
+  if (text.includes("desktop")) return "desktop";
+  if (text.includes("media")) return "media";
+  if (text.includes("data") || text.includes("document") || text.includes("spreadsheet")) return "data";
+  if (text.includes("security") || text.includes("cyber")) return "security";
+  if (text.includes("extension") || text.includes("plugin") || text.includes("skill")) return "extension";
+  if (text.includes("developer") || text.includes("coding") || text.includes("code")) return "coding";
+  return "general";
+}
+
+function buildPluginsPrompt(plugins: PluginManifest[]): string {
+  const selected = plugins.slice(0, 12);
+  if (selected.length === 0) return "";
+  return selected.map((plugin) => {
+    const lines = [
+      `## Plugin: ${plugin.name ?? plugin.id}`,
+      `ID: ${plugin.id}`,
+      `Version: ${plugin.version}`,
+      plugin.description ? `Description: ${plugin.description}` : "",
+      plugin.tools?.length ? `Advertised tools: ${plugin.tools.join(", ")}` : "",
+      plugin.skills?.length ? `Skills: ${plugin.skills.join(", ")}` : "",
+      plugin.mcpServers ? `MCP servers: ${Object.keys(plugin.mcpServers).join(", ")}` : "",
+      plugin.lspServers ? `LSP servers: ${Object.keys(plugin.lspServers).join(", ")}` : "",
+    ].filter(Boolean);
+    return lines.join("\n");
+  }).join("\n\n");
+}
+
+function expandDisallowedToolNames(names: string[]): string[] {
+  const aliases: Record<string, string[]> = {
+    bash: ["bash", "Bash"],
+    read: ["read", "Read"],
+    write: ["write", "Write"],
+    edit: ["edit", "Edit"],
+    patch: ["patch"],
+    grep: ["grep", "Grep"],
+    glob: ["glob", "Glob"],
+    ls: ["ls", "LS"],
+    webfetch: ["webfetch", "WebFetch"],
+    lsp: ["LSP", "lsp_status"],
+    todowrite: ["todowrite", "TodoWrite"],
+    task: ["Task"],
+    mcp: ["mcp_list_servers", "McpListTools", "McpCallTool", "ListMcpResourcesTool", "ReadMcpResourceTool", "ListMcpPromptsTool", "GetMcpInstructionsTool", "TestMcpServerTool"],
+    mcpcalltool: ["McpCallTool"],
+    listmcpresourcestool: ["ListMcpResourcesTool"],
+    readmcpresourcetool: ["ReadMcpResourceTool"],
+  };
+  const expanded = new Set<string>();
+  for (const name of names) {
+    expanded.add(name);
+    const key = name.toLowerCase();
+    for (const alias of aliases[key] ?? []) expanded.add(alias);
+  }
+  return [...expanded];
+}
+
 function summarizeInput(input: unknown): string {
   if (typeof input === "string") return input.slice(0, 60);
   if (typeof input === "object" && input !== null) {
@@ -590,6 +879,18 @@ function summarizeInput(input: unknown): string {
     return parts.join(", ");
   }
   return "";
+}
+
+function emitAssistantDelta(agent: string, color: string, text: string): void {
+  if (!bus.interactive || !text) return;
+  for (const char of text) {
+    bus.push({
+      type: "assistant:delta",
+      agent,
+      color,
+      message: char,
+    });
+  }
 }
 
 function findLastToolEvent(
@@ -715,58 +1016,7 @@ function estimateCost(
   inputTokens: number,
   outputTokens: number,
 ): number {
-  // Prices are per 1M tokens.
-  // Values are approximate and can be updated as providers change pricing.
-  const table: Record<
-    string,
-    { inputPerM: number; outputPerM: number; match: (model: string) => boolean }
-  > = {
-    openai_gpt41_mini: {
-      inputPerM: 0.4,
-      outputPerM: 1.6,
-      match: (m) => m.startsWith("gpt-4.1-mini"),
-    },
-    openai_gpt4o_mini: {
-      inputPerM: 0.15,
-      outputPerM: 0.6,
-      match: (m) => m.startsWith("gpt-4o-mini"),
-    },
-    openai_default: {
-      inputPerM: 3,
-      outputPerM: 15,
-      match: () => provider === "openai",
-    },
-    anthropic_sonnet: {
-      inputPerM: 3,
-      outputPerM: 15,
-      match: (m) => m.startsWith("claude-"),
-    },
-    google_gemini_flash: {
-      inputPerM: 0.15,
-      outputPerM: 0.6,
-      match: (m) =>
-        m.startsWith("gemini-2.5-flash") || m.startsWith("models/gemini-2.5-flash"),
-    },
-    google_gemini_pro: {
-      inputPerM: 1.25,
-      outputPerM: 10,
-      match: (m) =>
-        m.startsWith("gemini-2.5-pro") || m.startsWith("models/gemini-2.5-pro"),
-    },
-  };
-
-  let pricing: { inputPerM: number; outputPerM: number } = {
-    inputPerM: 3,
-    outputPerM: 15,
-  };
-
-  for (const entry of Object.values(table)) {
-    if (entry.match(modelId)) {
-      pricing = { inputPerM: entry.inputPerM, outputPerM: entry.outputPerM };
-      break;
-    }
-  }
-
+  const pricing = pricingForModel(provider, modelId);
   const inputCost = (inputTokens / 1_000_000) * pricing.inputPerM;
   const outputCost = (outputTokens / 1_000_000) * pricing.outputPerM;
   return inputCost + outputCost;

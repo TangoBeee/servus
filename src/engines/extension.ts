@@ -1,15 +1,26 @@
 import { generateText } from "ai";
+import { existsSync } from "node:fs";
 import { z } from "zod";
+import { createAgent, type IAgent } from "../agent.js";
 import { resolveModel } from "../provider.js";
 import { bus } from "../events.js";
-import { log, formatDuration } from "../log.js";
+import { log, formatDuration, ANSI } from "../log.js";
 import type { Engine, EngineContext, EngineResult, TaskDomain } from "../engine.js";
+import { createExtensionTools } from "../tools-extension.js";
 import {
   createPluginScaffold,
   createSkillScaffold,
+  validatePluginFile,
+  validateSkillFile,
   type ExtensionKind,
   type ExtensionTarget,
 } from "../extension-builder.js";
+import {
+  createInitialWorkflowState,
+  emitDomainWorkflowState,
+  type DomainWorkflowPhase,
+  runDomainWorkflowRuntime,
+} from "../domain-workflow-runtime.js";
 
 const EXTENSION_PROMPT = `
 # Role: Servus Extension Architect
@@ -48,10 +59,13 @@ Return ONLY valid JSON matching this shape:
 
 Rules:
 - Default target is "project" unless the user explicitly asks for a global/user skill or plugin.
-- Ask a question only when the user did not say whether they want a skill, plugin, or both.
+- Ask a question only when the user did not provide enough detail to decide skill/plugin/both safely.
 - Prefer skill for reusable workflows, prompts, standards, domain instructions, or procedural knowledge.
 - Prefer plugin for packaging skills/tools/MCP/config/activation together.
 - For custom executable tools, scaffold the manifest but keep tools as names only; tool runtime activation is a separate implementation step.
+- Use extension_readiness before writing.
+- Use create_skill/create_plugin or import/export/repair tools for package operations.
+- Always validate with validate_extension or extension_test_activation before servus_done.
 `.trim();
 
 const DomainSchema = z.enum([
@@ -93,81 +107,62 @@ export class ExtensionEngine implements Engine {
   readonly name = "extension";
   readonly description =
     "Creates Servus custom skills and local plugin manifests from natural-language prompts.";
+  private currentTask = "";
+  private agent: IAgent | null = null;
 
   async execute(ctx: EngineContext): Promise<EngineResult> {
     const startTime = Date.now();
+    this.currentTask = ctx.task;
     this.emitStatus("working");
+    this.emitProgress("orienting", "I’m translating your request into a Servus extension plan.", "Decide whether this should be a skill, plugin, or both.", "extension type, target scope, and generated files");
 
     try {
-      const spec = await inferExtensionSpec(ctx);
-      if (spec.kind === "question") {
-        const question = spec.question || "Do you want to create a skill, a plugin, or a plugin with a bundled skill?";
-        this.emitStatus("waiting_input");
-        return {
-          success: false,
-          needsInput: true,
-          summary: question,
-          question,
-          questions: [question],
-          cost: 0,
-          error: "Needs user input",
-        };
-      }
+      this.agent = await createAgent(ctx.backend, {
+        name: "Extension",
+        role: "extension-architect",
+        color: ANSI.magenta,
+        model: ctx.model,
+        domain: "extension",
+        prompt: EXTENSION_PROMPT,
+        extraTools: createExtensionTools(ctx) as Record<string, unknown>,
+        disallowedTools: ["bash", "write", "edit", "patch", "webfetch"],
+        sessionId: ctx.sessionId,
+      }, { cwd: ctx.cwd });
 
-      const target = spec.target ?? "project";
-      const results = [];
-
-      if (spec.kind === "skill") {
-        const skill = spec.skill ?? {};
-        results.push(await createSkillScaffold(ctx, {
-          name: skill.name || fallbackName(ctx.task, "skill"),
-          description: skill.description || `Custom Servus skill for: ${shortTask(ctx.task)}`,
-          prompt: ctx.task,
-          whenToUse: skill.whenToUse || ctx.task,
-          allowedTools: skill.allowedTools,
-          target,
-        }));
-      } else {
-        const plugin = spec.plugin ?? {};
-        const skill = spec.skill ?? {};
-        results.push(await createPluginScaffold(ctx, {
-          id: plugin.id || fallbackName(ctx.task, "plugin"),
-          name: plugin.name,
-          description: plugin.description || `Custom Servus plugin for: ${shortTask(ctx.task)}`,
-          prompt: ctx.task,
-          domains: plugin.domains as TaskDomain[] | undefined,
-          triggers: plugin.triggers ?? triggerWords(ctx.task),
-          capabilities: plugin.capabilities,
-          tools: plugin.tools,
-          includeSkill: spec.kind === "skill_and_plugin" || plugin.includeSkill,
-          skillName: skill.name || plugin.id || plugin.name,
-          skillDescription: skill.description || plugin.description,
-          target,
-        }));
-      }
-
-      const blocked = results.find((result) => result.summary.startsWith("Error:") || result.summary.startsWith("Action blocked"));
-      if (blocked) {
-        this.emitStatus("error");
-        return {
-          success: false,
-          summary: blocked.summary,
-          cost: 0,
-          error: blocked.summary,
-        };
-      }
-
-      this.emitStatus("done");
-      log.success("Extension scaffold completed in " + formatDuration(Date.now() - startTime));
-      return {
-        success: true,
-        summary: [
-          "Extension scaffold complete.",
-          ...results.map((result) => result.summary),
+      const result = await runDomainWorkflowRuntime({
+        agent: this.agent,
+        ctx,
+        domain: "extension",
+        progressRequired: true,
+        plan: [
+          "Identify whether the package should be a skill, plugin, or both.",
+          "Create, import, export, or repair the extension package.",
+          "Validate manifests/skills and run activation checks.",
+        ],
+        evidenceTypes: ["extension_spec", "manifest_validation", "skill_validation", "activation_test"],
+        initialMessage: [
+          "## Extension Task",
+          ctx.task,
+          "",
+          "## Working Directory",
+          "`" + ctx.cwd + "`",
+          "",
+          "Use extension tools to create/import/export/repair packages.",
+          "Before finalizing, validate the generated or inspected package and call servus_done with concrete files and validation evidence.",
         ].join("\n"),
-        artifacts: results.flatMap((result) => result.files),
-        cost: 0,
-      };
+      });
+
+      if (result.needsInput) {
+        this.emitStatus("waiting_input");
+        return result;
+      }
+      if (result.success) {
+        this.emitStatus("done");
+        log.success("Extension task completed in " + formatDuration(Date.now() - startTime));
+        return result;
+      }
+      this.emitStatus("error");
+      return result;
     } catch (err) {
       this.emitStatus("error");
       const message = err instanceof Error ? err.message : String(err);
@@ -181,7 +176,7 @@ export class ExtensionEngine implements Engine {
   }
 
   close(): void {
-    // No persistent resources.
+    this.agent?.close();
   }
 
   private emitStatus(status: "working" | "waiting_input" | "done" | "error"): void {
@@ -191,6 +186,73 @@ export class ExtensionEngine implements Engine {
       message: status,
     });
   }
+
+  private emitProgress(
+    phase: "orienting" | "planning" | "waiting_input" | "finalizing" | "blocked",
+    note: string,
+    nextAction: string,
+    evidenceNeeded: string,
+    confidence: "low" | "medium" | "high" = "medium",
+    blocker?: string,
+  ): void {
+    bus.push({
+      type: blocker || phase === "blocked" ? "agent:blocker" : "agent:working_note",
+      agent: "Extension",
+      message: note,
+      color: "#8b5cf6",
+      metadata: {
+        phase,
+        note,
+        nextAction,
+        evidenceNeeded,
+        confidence,
+        blocker,
+      },
+    });
+    emitDomainWorkflowState({
+      ...createInitialWorkflowState({
+        domain: "extension",
+        task: this.currentTask,
+        activeStep: note,
+      }),
+      phase: mapExtensionPhase(phase),
+      activeStep: note,
+      evidence: [{
+        type: "extension_spec",
+        source: "extension_engine",
+        summary: evidenceNeeded,
+        confidence,
+      }],
+      verification: blocker ? [blocker] : [],
+    }, "Extension");
+  }
+}
+
+function mapExtensionPhase(phase: "orienting" | "planning" | "waiting_input" | "finalizing" | "blocked"): DomainWorkflowPhase {
+  if (phase === "orienting") return "orient";
+  if (phase === "planning") return "plan";
+  if (phase === "waiting_input") return "waiting_input";
+  if (phase === "blocked") return "failed";
+  return "finalize";
+}
+
+function validateScaffoldResults(results: Array<{ kind: "skill" | "plugin"; files: string[] }>): string[] {
+  const issues: string[] = [];
+  for (const result of results) {
+    if (result.files.length === 0) {
+      issues.push(`No files were created for ${result.kind}.`);
+      continue;
+    }
+    for (const file of result.files) {
+      if (!existsSync(file)) {
+        issues.push(`Missing expected generated file: ${file}`);
+        continue;
+      }
+      if (file.endsWith("SKILL.md")) issues.push(...validateSkillFile(file));
+      if (file.endsWith("servus.plugin.json")) issues.push(...validatePluginFile(file));
+    }
+  }
+  return [...new Set(issues)];
 }
 
 async function inferExtensionSpec(ctx: EngineContext): Promise<ExtensionSpec> {

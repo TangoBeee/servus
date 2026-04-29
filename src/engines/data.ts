@@ -8,9 +8,8 @@ import { log, ANSI, formatDuration } from "../log.js";
 import { bus } from "../events.js";
 import { createDataTools } from "../tools-data.js";
 import type { Engine, EngineContext, EngineResult } from "../engine.js";
-import { detectClarificationRequest, stripProtocolTags } from "../clarification.js";
 import { SERVUS_OPERATING_LOOP } from "../prompts/operating-loop.js";
-import { resultFromValidatedResponse } from "../agentic-loop.js";
+import { runDomainWorkflowRuntime } from "../domain-workflow-runtime.js";
 
 const DATA_PROMPT = `
 # Role: Data & Docs Assistant
@@ -28,6 +27,12 @@ ${SERVUS_OPERATING_LOOP}
 - \`document_info\` — inspect file type, size, pages, sheets, rows, and columns.
 - \`extract_document_text\` — extract readable text from PDFs, DOCX, TXT/MD, and tables.
 - \`extract_table\` — extract rows from CSV, TSV, XLS/XLSX, or JSON.
+- \`data_profile\` — profile one or more documents/tables before analysis.
+- \`data_schema_infer\` — infer table schema, types, nulls, samples, and stats.
+- \`data_query_table\` — run safe SQL-style table filters/select/order/limit.
+- \`data_summarize_table\` — produce row/column/group summaries and data-quality notes.
+- \`data_merge_tables\` — merge two table files by key with artifact verification.
+- \`data_report_template\` — create a structured report skeleton when planning output.
 - \`write_table\` — write CSV, TSV, XLSX, or JSON.
 - \`convert_table\` — convert table formats.
 - \`create_report\` — create Markdown/text report artifacts.
@@ -74,6 +79,7 @@ export class DataEngine implements Engine {
         role: "data-docs",
         color: ANSI.green,
         model: ctx.model,
+        domain: "data",
         prompt: DATA_PROMPT,
         extraTools: dataTools as Record<string, unknown>,
         disallowedTools: ["bash", "write", "edit", "patch", "webfetch"],
@@ -83,7 +89,18 @@ export class DataEngine implements Engine {
       log.success("Data & Docs agent initialized");
       this.emitStatus("working");
 
-      const response = await this.agent.send([
+      const result = await runDomainWorkflowRuntime({
+        agent: this.agent,
+        ctx,
+        domain: "data",
+        progressRequired: true,
+        plan: [
+          "Profile source files and infer schema when tabular.",
+          "Extract/query/merge/convert only after source inspection.",
+          "Verify output artifacts and metadata before completion.",
+        ],
+        evidenceTypes: ["document_profile", "table_schema", "extraction_result", "report_artifact"],
+        initialMessage: [
         "## Data & Docs Task",
         ctx.task,
         "",
@@ -92,53 +109,22 @@ export class DataEngine implements Engine {
         "",
         "Complete this task using servus_done with source/output evidence.",
         "If required user details are missing and you cannot proceed safely, call servus_need_input and ask only the necessary question.",
-      ].join("\n"));
-
-      this.emitStatus("done");
-
-      const cost = this.agent.cost;
+      ].join("\n"),
+      });
       const elapsed = Date.now() - startTime;
-      const clarification = detectClarificationRequest(response.text, ctx.task);
-      const cleaned = stripProtocolTags(response.text);
-      const finalized = resultFromValidatedResponse(ctx, "data", response);
-      if (finalized) {
-        this.emitStatus(finalized.needsInput ? "waiting_input" : finalized.success ? "done" : "error");
-        return finalized;
-      }
-
-      if (clarification) {
+      if (result.needsInput) {
         log.warn("Data task is waiting for user input.");
         this.emitStatus("waiting_input");
-        return {
-          success: false,
-          needsInput: true,
-          summary: clarification.message,
-          question: clarification.message,
-          questions: clarification.questions,
-          questionContext: clarification.context,
-          clarification,
-          cost,
-          error: "Needs user input",
-        };
+        return result;
       }
-
-      if (response.text.includes("<task_status>DONE</task_status>")) {
+      if (result.success) {
         log.success("Data task completed in " + formatDuration(elapsed));
-        return {
-          success: true,
-          summary: cleaned,
-          cost,
-        };
+        this.emitStatus("done");
+        return result;
       }
 
-      log.warn("Data agent did not signal completion.");
       this.emitStatus("error");
-      return {
-        success: false,
-        summary: "Data agent did not complete the task within the allowed turns.",
-        cost,
-        error: "Agent did not signal DONE",
-      };
+      return result;
     } catch (err) {
       this.emitStatus("error");
       return {

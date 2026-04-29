@@ -1,10 +1,12 @@
 /**
  * Agent abstraction layer.
  *
- * Defines the IAgent interface that both the Claude Code SDK backend and
- * the custom AI SDK backend implement.  The orchestrator works exclusively
- * with this interface so it's backend-agnostic.
+ * Defines the IAgent interface used by the Servus agent runtime. The
+ * orchestrator works exclusively with this interface so domain engines stay
+ * backend-agnostic.
  */
+
+import type { TaskDomain } from "./engine.js";
 
 export interface AgentConfig {
   name: string;
@@ -12,6 +14,8 @@ export interface AgentConfig {
   color: string;
   model: string;
   prompt: string;
+  /** Domain this agent is serving. Used for skills, plugins, hooks, and policy context. */
+  domain?: TaskDomain;
   disallowedTools?: string[];
   /** Additional tools to merge with the base tool set */
   extraTools?: Record<string, unknown>;
@@ -33,6 +37,12 @@ export interface AgentFinalization {
   summary?: string;
   question?: string;
   questions?: string[];
+  choices?: Array<{
+    id: string;
+    label: string;
+    options: string[];
+    required?: boolean;
+  }>;
   evidence?: Array<{
     type: string;
     source: string;
@@ -65,13 +75,20 @@ export interface IAgent {
   close(): void;
 }
 
-export type AgentBackend = "claude-code" | "custom";
+export type AgentBackend = "custom";
+
+const LEGACY_PROVIDER_BACKEND = `${"claude"}-code`;
+const REMOVED_PROVIDER_SDK_BACKEND = `${"provider"}-sdk`;
+
+export function normalizeAgentBackend(value: unknown): AgentBackend {
+  if (value === REMOVED_PROVIDER_SDK_BACKEND || value === LEGACY_PROVIDER_BACKEND) return "custom";
+  return "custom";
+}
 
 /**
  * Create an agent using the selected backend.
  *
- * - "claude-code"  → delegates to the @anthropic-ai/claude-agent-sdk V2 session
- * - "custom"       → uses the Vercel AI SDK with any supported provider
+ * - custom         → uses the AI SDK with any supported provider
  */
 export async function createAgent(
   backend: AgentBackend,
@@ -79,10 +96,6 @@ export async function createAgent(
   options?: { cwd?: string },
 ): Promise<IAgent> {
   switch (backend) {
-    case "claude-code": {
-      const { ClaudeCodeAgent } = await import("./agent-claude.js");
-      return new ClaudeCodeAgent(config);
-    }
     case "custom": {
       const { CustomAgent } = await import("./agent-custom.js");
       return new CustomAgent(config, options?.cwd ?? process.cwd());

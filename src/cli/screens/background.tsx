@@ -118,7 +118,7 @@ export function BackgroundScreen({ onBack, onInputLockedChange, inputBlocked = f
       budget: meta.budget,
     })
       .then((name) => {
-        createSession(followUpTask, meta.model ?? "gpt-4o-mini", meta.mode ?? "custom", meta.cwd);
+        createSession(followUpTask, meta.model ?? "gpt-5-mini", meta.mode ?? "custom", meta.cwd);
         bus.push({ type: "success", message: `Follow-up job started: ${name}` });
         setMessage(`Follow-up started: ${name}`);
         setShowFollowUp(false);

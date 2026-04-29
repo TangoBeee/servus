@@ -33,6 +33,22 @@ export interface PluginScaffoldInput {
   triggers?: string[];
   capabilities?: string[];
   tools?: string[];
+  hooks?: Record<string, Array<{
+    matcher?: string;
+    hooks: Array<{
+      type?: "command" | "http" | "prompt";
+      command?: string;
+      url?: string;
+      prompt?: string;
+      model?: string;
+      timeoutMs?: number;
+      statusMessage?: string;
+      blocking?: boolean;
+      async?: boolean;
+      once?: boolean;
+      headers?: Record<string, string>;
+    }>;
+  }>>;
   includeSkill?: boolean;
   skillName?: string;
   skillDescription?: string;
@@ -178,6 +194,7 @@ export async function createPluginScaffold(
     tools: input.tools ?? [],
     skills: skillNames,
     mcpServers: {},
+    ...(input.hooks ? { hooks: sanitizePluginHooks(input.hooks) } : {}),
     configSchema: {},
     activation: {
       ...(input.triggers?.length ? { triggers: input.triggers } : {}),
@@ -222,6 +239,9 @@ export function validatePluginFile(path: string): string[] {
     if (typeof parsed.version !== "string" || !parsed.version.trim()) issues.push("Missing plugin version.");
     if (parsed.activation != null && typeof parsed.activation !== "object") {
       issues.push("activation must be an object.");
+    }
+    if (parsed.hooks != null && typeof parsed.hooks !== "object") {
+      issues.push("hooks must be an object keyed by Servus hook event name.");
     }
   } catch (err) {
     issues.push(`Invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
@@ -284,6 +304,50 @@ function sanitizeDomains(domains: TaskDomain[]): TaskDomain[] {
     if (VALID_DOMAINS.includes(domain)) unique.add(domain);
   }
   return [...unique];
+}
+
+function sanitizePluginHooks(input: NonNullable<PluginScaffoldInput["hooks"]>): NonNullable<PluginScaffoldInput["hooks"]> {
+  const validEvents = new Set([
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Notification",
+    "PreCompact",
+    "PostCompact",
+    "Stop",
+    "StopFailure",
+    "SubagentStop",
+    "TaskCreated",
+    "TaskCompleted",
+  ]);
+  const result: NonNullable<PluginScaffoldInput["hooks"]> = {};
+  for (const [event, matchers] of Object.entries(input)) {
+    if (!validEvents.has(event) || !Array.isArray(matchers)) continue;
+    const nextMatchers = matchers
+      .map((matcher) => ({
+        ...(matcher.matcher ? { matcher: matcher.matcher } : {}),
+        hooks: (matcher.hooks ?? [])
+          .filter((hook) => hook.command || hook.url || hook.prompt)
+          .map((hook) => ({
+            type: hook.type ?? (hook.url ? "http" : hook.prompt ? "prompt" : "command"),
+            ...(hook.command ? { command: hook.command } : {}),
+            ...(hook.url ? { url: hook.url } : {}),
+            ...(hook.prompt ? { prompt: hook.prompt } : {}),
+            ...(hook.model ? { model: hook.model } : {}),
+            ...(hook.timeoutMs ? { timeoutMs: hook.timeoutMs } : {}),
+            ...(hook.statusMessage ? { statusMessage: hook.statusMessage } : {}),
+            ...(hook.blocking !== undefined ? { blocking: hook.blocking } : {}),
+            ...(hook.async !== undefined ? { async: hook.async } : {}),
+            ...(hook.once !== undefined ? { once: hook.once } : {}),
+            ...(hook.headers ? { headers: hook.headers } : {}),
+          })),
+      }))
+      .filter((matcher) => matcher.hooks.length > 0);
+    if (nextMatchers.length > 0) result[event] = nextMatchers;
+  }
+  return result;
 }
 
 async function guardWrite(

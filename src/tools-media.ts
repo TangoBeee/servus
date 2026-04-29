@@ -9,8 +9,8 @@ import { tool } from "ai";
 import { z } from "zod";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, mkdirSync, statSync } from "node:fs";
-import { basename, dirname, extname, isAbsolute, relative, resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { registerChild, unregisterChild } from "./child-registry.js";
 import { assessRisk, requestConsent } from "./consent.js";
 import type { EngineContext } from "./engine.js";
@@ -24,6 +24,7 @@ const downloadVideoSchema = z.object({
   outputDir: z.string().optional().describe("Directory to save the video (default: ~/Downloads)"),
   format: z.enum(["best", "mp4", "mp3", "audio"]).optional().describe("Format: 'best' (default), 'mp4', 'mp3' (audio only), 'audio' (best audio)"),
   quality: z.string().optional().describe("Quality preference: '720', '1080', '4k', or 'best' (default)"),
+  retries: z.number().int().min(0).max(3).optional().describe("Retry transient downloader failures up to this many times. Default 1."),
 });
 
 const convertMediaSchema = z.object({
@@ -71,6 +72,28 @@ const thumbnailSchema = z.object({
   output: z.string(),
   time: z.string().optional().describe("Timestamp for thumbnail. Default 00:00:01."),
   overwrite: z.boolean().optional(),
+});
+
+const mediaPlanJobSchema = z.object({
+  operation: z.enum(["info", "download", "convert", "trim", "compress", "extract_audio", "thumbnail"]),
+  input: z.string().optional().describe("Local input path or URL depending on operation."),
+  output: z.string().optional().describe("Output path for artifact-producing operations."),
+  preset: z.string().optional().describe("Preset id from media_presets."),
+  overwrite: z.boolean().optional(),
+});
+
+const mediaBatchPlanSchema = z.object({
+  directory: z.string().describe("Directory containing input media files."),
+  operation: z.enum(["convert", "compress", "extract_audio", "thumbnail", "info"]),
+  outputDir: z.string().optional(),
+  inputExt: z.array(z.string()).optional().describe("Extensions to include, e.g. ['.mp4', '.mov']."),
+  outputExt: z.string().optional().describe("Output extension for generated files."),
+  limit: z.number().int().positive().max(200).optional(),
+  overwrite: z.boolean().optional(),
+});
+
+const mediaProgressSummarySchema = z.object({
+  log: z.string().describe("Raw ffmpeg or yt-dlp output to summarize."),
 });
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -169,6 +192,58 @@ function runCommandCapture(command: string, args: string[], cwd: string, timeout
   });
 }
 
+function runYtdlpDownload(args: string[], outDir: string): Promise<{ ok: boolean; message: string; transient: boolean }> {
+  return new Promise((res) => {
+    const child = spawn("yt-dlp", args, {
+      cwd: outDir,
+      env: { ...process.env, FORCE_COLOR: "0" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    if (child.pid) registerChild(child.pid, {});
+
+    const chunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+    child.stdout?.on("data", (d: Buffer) => chunks.push(d));
+    child.stderr?.on("data", (d: Buffer) => errChunks.push(d));
+
+    const timeout = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* */ }
+      res({ ok: false, transient: true, message: "Error: download timed out after 5 minutes" });
+    }, 300_000);
+
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (child.pid) unregisterChild(child.pid);
+
+      const stdout = Buffer.concat(chunks).toString("utf-8");
+      const stderr = Buffer.concat(errChunks).toString("utf-8");
+
+      if (code === 0) {
+        const destMatch = stdout.match(/Destination:\s*(.+)/);
+        const mergeMatch = stdout.match(/Merging formats into "(.+)"/);
+        const alreadyMatch = stdout.match(/has already been downloaded/);
+        const filePath = mergeMatch?.[1] ?? destMatch?.[1] ?? "unknown";
+        if (alreadyMatch) {
+          res({ ok: true, transient: false, message: "Video was already downloaded: " + filePath });
+          return;
+        }
+        let sizeInfo = "";
+        try {
+          const st = statSync(filePath);
+          sizeInfo = " (" + formatFileSize(st.size) + ")";
+        } catch { /* ignore */ }
+        res({ ok: true, transient: false, message: "Downloaded successfully: " + filePath + sizeInfo });
+        return;
+      }
+
+      const output = (stderr || stdout).slice(0, 2000);
+      const transient = /timed out|timeout|temporarily|429|503|502|network|connection|reset|try again/i.test(output);
+      res({ ok: false, transient, message: "Download failed (exit " + code + "):\n" + output });
+    });
+  });
+}
+
 function splitArgs(value: string): string[] {
   const args: string[] = [];
   let current = "";
@@ -200,6 +275,56 @@ function splitArgs(value: string): string[] {
 function mediaOutputSummary(action: string, path: string): string {
   const size = existsSync(path) ? ` (${formatFileSize(statSync(path).size)})` : "";
   return `${action}: ${path}${size}\nArtifact: ${path}`;
+}
+
+function requiredMediaCommands(operation: string): string[] {
+  if (operation === "download") return ["yt-dlp"];
+  if (operation === "info") return ["ffprobe"];
+  return operation === "extract_audio" || operation === "convert" || operation === "trim" || operation === "compress" || operation === "thumbnail"
+    ? ["ffmpeg"]
+    : [];
+}
+
+function suggestedMediaOutput(cwd: string, operation: string, input?: string, preset?: string): string | undefined {
+  if (!input || /^https?:\/\//i.test(input)) return operation === "download" ? resolve(process.env.HOME ?? cwd, "Downloads") : undefined;
+  const inputPath = resolveMediaPath(cwd, input);
+  const base = inputPath.replace(extname(inputPath), "");
+  if (operation === "extract_audio") return `${base}.mp3`;
+  if (operation === "thumbnail") return `${base}.jpg`;
+  if (operation === "compress") return `${base}.compressed.mp4`;
+  if (operation === "trim") return `${base}.clip${extname(inputPath) || ".mp4"}`;
+  if (operation === "convert") {
+    if (preset === "audio_mp3") return `${base}.mp3`;
+    if (preset === "audio_wav") return `${base}.wav`;
+    return `${base}.mp4`;
+  }
+  return undefined;
+}
+
+function defaultOutputExt(operation: string, inputExt: string): string {
+  if (operation === "extract_audio") return ".mp3";
+  if (operation === "thumbnail") return ".jpg";
+  if (operation === "convert" || operation === "compress") return ".mp4";
+  if (operation === "trim") return inputExt || ".mp4";
+  return inputExt || ".out";
+}
+
+function summarizeMediaProgress(log: string): string {
+  const lines = log.split(/\r?\n|\r/).map((line) => line.trim()).filter(Boolean);
+  const lastLines = lines.slice(-20);
+  const ytProgress = [...log.matchAll(/\[download]\s+([0-9.]+)%.*?at\s+([^\s]+).*?ETA\s+([^\s]+)/g)].pop();
+  const ffTime = [...log.matchAll(/time=([0-9:.]+).*?speed=\s*([0-9.]+x)/g)].pop();
+  const destination = log.match(/Destination:\s*(.+)/)?.[1] ?? log.match(/Merging formats into "(.+)"/)?.[1];
+  const errors = lastLines.filter((line) => /error|failed|invalid|not found/i.test(line)).slice(-5);
+  return [
+    "Media progress summary:",
+    ytProgress ? `Download: ${ytProgress[1]}% at ${ytProgress[2]}, ETA ${ytProgress[3]}` : "",
+    ffTime ? `ffmpeg: processed to ${ffTime[1]} at ${ffTime[2]}` : "",
+    destination ? `Destination: ${destination}` : "",
+    errors.length ? `Warnings/errors:\n${errors.map((line) => `- ${line}`).join("\n")}` : "",
+    !ytProgress && !ffTime && !destination && !errors.length ? "No structured progress markers found. Tail follows:" : "",
+    !ytProgress && !ffTime && !destination && !errors.length ? lastLines.join("\n") : "",
+  ].filter(Boolean).join("\n");
 }
 
 // ─── Tool Factory ───────────────────────────────────────────────────────────
@@ -236,6 +361,112 @@ export function createMediaToolsWithContext(ctx: Pick<EngineContext, "cwd" | "on
           missing.length ? `Install: brew install ${missing.join(" ")}` : "",
         ].filter(Boolean).join("\n");
       },
+    }),
+
+    media_presets: tool({
+      description: "List safe media presets for conversion, compression, extraction, thumbnails, and downloads.",
+      inputSchema: z.object({}),
+      execute: async () => [
+        "Media presets:",
+        "- mp4_h264: Convert video to MP4/H.264 with AAC audio.",
+        "- web_mp4_small: Compress video for web sharing with CRF 28.",
+        "- audio_mp3: Extract MP3 audio at high VBR quality.",
+        "- audio_wav: Extract uncompressed WAV audio.",
+        "- clip_copy: Trim a clip without re-encoding when possible.",
+        "- thumbnail_jpg: Generate a JPG thumbnail at 00:00:01.",
+        "- download_best_mp4: Download best available MP4 where available.",
+        "",
+        "Use media_plan_job before long operations to verify inputs, outputs, and overwrite safety.",
+      ].join("\n"),
+    }),
+
+    media_plan_job: tool({
+      description: [
+        "Dry-run a media operation and return prerequisites, output naming, overwrite risks, and verification plan.",
+        "Use before download/convert/trim/compress/extract_audio/thumbnail when outputs matter.",
+      ].join("\n"),
+      inputSchema: mediaPlanJobSchema,
+      execute: async (input: z.infer<typeof mediaPlanJobSchema>) => {
+        const inputIsUrl = Boolean(input.input && /^https?:\/\//i.test(input.input));
+        const inputPath = input.input && !inputIsUrl ? resolveMediaPath(cwd, input.input) : input.input;
+        const outputPath = input.output ? resolveMediaPath(cwd, input.output) : suggestedMediaOutput(cwd, input.operation, input.input, input.preset);
+        const required = requiredMediaCommands(input.operation);
+        const readiness = await Promise.all(required.map(async (command) => ({ command, ok: await commandExists(command) })));
+        const outputExists = outputPath ? existsSync(outputPath) : false;
+        return [
+          `Media job plan: ${input.operation}`,
+          input.preset ? `Preset: ${input.preset}` : "",
+          input.input ? `Input: ${input.input}` : "",
+          inputPath && !inputIsUrl ? `Input exists: ${existsSync(inputPath)}` : "",
+          outputPath ? `Output: ${outputPath}` : "",
+          outputPath ? `Output exists: ${outputExists}` : "",
+          `Overwrite allowed: ${Boolean(input.overwrite)}`,
+          outputExists && !input.overwrite ? "Blocked: output exists and overwrite=false." : "",
+          `Required tools: ${readiness.map((item) => `${item.command}=${item.ok ? "ok" : "missing"}`).join(", ") || "none"}`,
+          `Consent needed: ${Boolean(outputPath && (outputExists || isOutside(cwd, outputPath)))}`,
+          "Verification: run media_info or inspect output file existence/size after action.",
+        ].filter(Boolean).join("\n");
+      },
+    }),
+
+    media_batch_plan: tool({
+      description: [
+        "Plan a batch media workflow over a directory without mutating files.",
+        "Reports input files, proposed outputs, collisions, missing prerequisites, and verification steps.",
+      ].join("\n"),
+      inputSchema: mediaBatchPlanSchema,
+      execute: async (input: z.infer<typeof mediaBatchPlanSchema>) => {
+        const directory = resolveMediaPath(cwd, input.directory);
+        if (!existsSync(directory)) return `Error: directory not found — ${directory}`;
+        const outputDir = input.outputDir ? resolveMediaPath(cwd, input.outputDir) : directory;
+        const limit = input.limit ?? 50;
+        const inputExts = (input.inputExt?.length ? input.inputExt : [".mp4", ".mov", ".mkv", ".webm", ".mp3", ".wav", ".m4a"])
+          .map((ext) => ext.startsWith(".") ? ext.toLowerCase() : `.${ext.toLowerCase()}`);
+        const files = readdirSync(directory)
+          .map((name) => join(directory, name))
+          .filter((path) => {
+            try {
+              return statSync(path).isFile() && inputExts.includes(extname(path).toLowerCase());
+            } catch {
+              return false;
+            }
+          })
+          .slice(0, limit);
+        const required = requiredMediaCommands(input.operation);
+        const readiness = await Promise.all(required.map(async (command) => ({ command, ok: await commandExists(command) })));
+        const planned = files.map((file) => {
+          const output = input.operation === "info"
+            ? undefined
+            : join(outputDir, basename(file, extname(file)) + (input.outputExt ?? defaultOutputExt(input.operation, extname(file))));
+          return {
+            input: file,
+            output,
+            outputExists: output ? existsSync(output) : false,
+            blocked: output ? existsSync(output) && !input.overwrite : false,
+          };
+        });
+        return [
+          `Media batch plan: ${input.operation}`,
+          `Directory: ${directory}`,
+          `Matched files: ${files.length}`,
+          `Required tools: ${readiness.map((item) => `${item.command}=${item.ok ? "ok" : "missing"}`).join(", ") || "none"}`,
+          `Output directory: ${outputDir}`,
+          "",
+          ...planned.map((item, index) => [
+            `[${index + 1}] ${item.input}`,
+            item.output ? `  -> ${item.output}` : "",
+            item.outputExists ? `  outputExists=true${item.blocked ? " (blocked without overwrite)" : ""}` : "",
+          ].filter(Boolean).join("\n")),
+          "",
+          "Verification: inspect each generated output for existence, size, and media_info when applicable.",
+        ].join("\n");
+      },
+    }),
+
+    media_progress_summary: tool({
+      description: "Summarize ffmpeg or yt-dlp progress output into percent/time/speed/status lines.",
+      inputSchema: mediaProgressSummarySchema,
+      execute: async (input: z.infer<typeof mediaProgressSummarySchema>) => summarizeMediaProgress(input.log),
     }),
 
     download_video: tool({
@@ -278,56 +509,24 @@ export function createMediaToolsWithContext(ctx: Pick<EngineContext, "cwd" | "on
 
         args.push(input.url);
 
-        return new Promise<string>((res) => {
-          const child = spawn("yt-dlp", args, {
-            cwd: outDir,
-            env: { ...process.env, FORCE_COLOR: "0" },
-            stdio: ["ignore", "pipe", "pipe"],
-          });
-
-          if (child.pid) registerChild(child.pid, {});
-
-          const chunks: Buffer[] = [];
-          const errChunks: Buffer[] = [];
-          child.stdout?.on("data", (d: Buffer) => chunks.push(d));
-          child.stderr?.on("data", (d: Buffer) => errChunks.push(d));
-
-          const timeout = setTimeout(() => {
-            try { child.kill("SIGKILL"); } catch { /* */ }
-            res("Error: download timed out after 5 minutes");
-          }, 300_000); // 5 min timeout
-
-          child.on("close", (code) => {
-            clearTimeout(timeout);
-            if (child.pid) unregisterChild(child.pid);
-
-            const stdout = Buffer.concat(chunks).toString("utf-8");
-            const stderr = Buffer.concat(errChunks).toString("utf-8");
-
-            if (code === 0) {
-              // Try to find the downloaded file path from stdout
-              const destMatch = stdout.match(/Destination:\s*(.+)/);
-              const mergeMatch = stdout.match(/Merging formats into "(.+)"/);
-              const alreadyMatch = stdout.match(/has already been downloaded/);
-
-              const filePath = mergeMatch?.[1] ?? destMatch?.[1] ?? "unknown";
-
-              if (alreadyMatch) {
-                res("Video was already downloaded: " + filePath);
-              } else {
-                // Get file size
-                let sizeInfo = "";
-                try {
-                  const st = statSync(filePath);
-                  sizeInfo = " (" + formatFileSize(st.size) + ")";
-                } catch { /* ignore */ }
-                res("Downloaded successfully: " + filePath + sizeInfo);
-              }
-            } else {
-              res("Download failed (exit " + code + "):\n" + (stderr || stdout).slice(0, 2000));
-            }
-          });
-        });
+        const attempts = Math.max(1, (input.retries ?? 1) + 1);
+        const failures: string[] = [];
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+          const result = await runYtdlpDownload(args, outDir);
+          if (result.ok) {
+            return [
+              result.message,
+              `Attempts: ${attempt}/${attempts}`,
+              "Verification: inspect the downloaded artifact path/size before finalizing.",
+            ].join("\n");
+          }
+          failures.push(`Attempt ${attempt}: ${result.message}`);
+          if (!result.transient || attempt === attempts) break;
+        }
+        return [
+          "Download failed after retry policy.",
+          ...failures,
+        ].join("\n\n");
       },
     }),
 

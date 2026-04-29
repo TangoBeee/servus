@@ -52,7 +52,58 @@ const createReportSchema = z.object({
   overwrite: z.boolean().optional(),
 });
 
+const dataProfileSchema = z.object({
+  paths: z.array(z.string()).min(1).max(50).describe("Document/table paths to profile."),
+  sampleRows: z.number().int().positive().max(500).optional(),
+});
+
+const dataSchemaInferSchema = z.object({
+  path: z.string().describe("CSV, TSV, XLS/XLSX, or JSON table path."),
+  sheet: z.union([z.string(), z.number()]).optional(),
+  sampleRows: z.number().int().positive().max(20_000).optional(),
+});
+
+const dataQueryTableSchema = z.object({
+  path: z.string().describe("CSV, TSV, XLS/XLSX, or JSON table path."),
+  sheet: z.union([z.string(), z.number()]).optional(),
+  select: z.array(z.string()).optional().describe("Columns to include. Defaults to all columns."),
+  where: z.array(z.object({
+    column: z.string(),
+    op: z.enum(["eq", "neq", "contains", "gt", "gte", "lt", "lte", "empty", "not_empty"]),
+    value: z.union([z.string(), z.number(), z.boolean()]).optional(),
+  })).optional(),
+  orderBy: z.string().optional(),
+  order: z.enum(["asc", "desc"]).optional(),
+  limit: z.number().int().positive().max(1000).optional(),
+});
+
+const dataSummarizeTableSchema = z.object({
+  path: z.string().describe("CSV, TSV, XLS/XLSX, or JSON table path."),
+  sheet: z.union([z.string(), z.number()]).optional(),
+  groupBy: z.array(z.string()).max(3).optional().describe("Optional categorical columns to group by."),
+  sampleRows: z.number().int().positive().max(20_000).optional(),
+});
+
+const dataMergeTablesSchema = z.object({
+  leftPath: z.string(),
+  rightPath: z.string(),
+  leftKey: z.string(),
+  rightKey: z.string().optional(),
+  outputPath: z.string().describe("Destination .csv, .tsv, .xlsx, or .json path."),
+  join: z.enum(["inner", "left"]).optional(),
+  overwrite: z.boolean().optional(),
+});
+
+const dataReportTemplateSchema = z.object({
+  title: z.string(),
+  outputPath: z.string().optional().describe("Optional .md/.txt output path. If omitted, returns the template only."),
+  sources: z.array(z.string()).optional(),
+  sections: z.array(z.string()).optional().describe("Requested report sections."),
+  overwrite: z.boolean().optional(),
+});
+
 type DataToolContext = Pick<EngineContext, "cwd" | "onConsent">;
+type DataQueryCondition = NonNullable<z.infer<typeof dataQueryTableSchema>["where"]>[number];
 
 export function createDataTools(ctx: DataToolContext) {
   return {
@@ -148,6 +199,147 @@ export function createDataTools(ctx: DataToolContext) {
           "JSON:",
           JSON.stringify(rows.slice(0, input.maxRows ?? 200), null, 2),
         ].join("\n");
+      },
+    }),
+
+    data_profile: tool({
+      description: [
+        "Profile one or more data/doc files before extraction or reporting.",
+        "Returns document/table metadata, previews, row/page/sheet counts, and artifact evidence.",
+      ].join("\n"),
+      inputSchema: dataProfileSchema,
+      execute: async (input: z.infer<typeof dataProfileSchema>) => {
+        const profiles: string[] = [];
+        for (const rawPath of input.paths) {
+          const path = resolveInputPath(ctx.cwd, rawPath);
+          profiles.push(await profileDataPath(path, input.sampleRows ?? 50));
+        }
+        return [
+          `Data profile collection: ${profiles.length} source(s)`,
+          "",
+          profiles.join("\n\n---\n\n"),
+        ].join("\n");
+      },
+    }),
+
+    data_schema_infer: tool({
+      description: [
+        "Infer table schema, column types, null counts, distinct samples, and numeric summaries.",
+        "Use before transforming, joining, or reporting on tabular data.",
+      ].join("\n"),
+      inputSchema: dataSchemaInferSchema,
+      execute: async (input: z.infer<typeof dataSchemaInferSchema>) => {
+        const path = resolveInputPath(ctx.cwd, input.path);
+        if (!existsSync(path)) return `Error: file not found — ${path}`;
+        const rows = readTable(path, input.sheet, undefined, input.sampleRows ?? MAX_TABLE_ROWS);
+        return renderSchemaInference(path, rows);
+      },
+    }),
+
+    data_query_table: tool({
+      description: [
+        "Run a safe SQL-style query over CSV/TSV/XLSX/JSON table data.",
+        "Supports select, simple where filters, order, and limit.",
+      ].join("\n"),
+      inputSchema: dataQueryTableSchema,
+      execute: async (input: z.infer<typeof dataQueryTableSchema>) => {
+        const path = resolveInputPath(ctx.cwd, input.path);
+        if (!existsSync(path)) return `Error: file not found — ${path}`;
+        const rows = readTable(path, input.sheet, undefined, MAX_TABLE_ROWS);
+        const queried = queryRows(rows, input);
+        const columns = collectColumns(queried);
+        return [
+          `Query source: ${path}`,
+          `Input rows: ${rows.length}`,
+          `Output rows: ${queried.length}`,
+          `Columns: ${columns.join(", ") || "(none)"}`,
+          "",
+          tablePreview(queried),
+          "",
+          "JSON:",
+          JSON.stringify(queried.slice(0, input.limit ?? 200), null, 2),
+        ].join("\n");
+      },
+    }),
+
+    data_summarize_table: tool({
+      description: [
+        "Summarize table data with row counts, column profiles, numeric stats, top categorical values, and optional group counts.",
+        "Use this for SQL-style summaries and project reports before writing a final report.",
+      ].join("\n"),
+      inputSchema: dataSummarizeTableSchema,
+      execute: async (input: z.infer<typeof dataSummarizeTableSchema>) => {
+        const path = resolveInputPath(ctx.cwd, input.path);
+        if (!existsSync(path)) return `Error: file not found — ${path}`;
+        const rows = readTable(path, input.sheet, undefined, input.sampleRows ?? MAX_TABLE_ROWS);
+        return summarizeRows(path, rows, input.groupBy ?? []);
+      },
+    }),
+
+    data_merge_tables: tool({
+      description: [
+        "Merge two table files by key and write the result to CSV/TSV/XLSX/JSON.",
+        "Use data_schema_infer first when column names or key quality are uncertain.",
+      ].join("\n"),
+      inputSchema: dataMergeTablesSchema,
+      execute: async (input: z.infer<typeof dataMergeTablesSchema>) => {
+        const leftPath = resolveInputPath(ctx.cwd, input.leftPath);
+        const rightPath = resolveInputPath(ctx.cwd, input.rightPath);
+        if (!existsSync(leftPath)) return `Error: left table not found — ${leftPath}`;
+        if (!existsSync(rightPath)) return `Error: right table not found — ${rightPath}`;
+        const outputPath = resolveOutputPath(ctx.cwd, input.outputPath);
+        const consent = await guardWrite(ctx, "data_merge_tables", outputPath, input.overwrite);
+        if (consent) return consent;
+        const left = readTable(leftPath, undefined, undefined, MAX_TABLE_ROWS);
+        const right = readTable(rightPath, undefined, undefined, MAX_TABLE_ROWS);
+        const merged = mergeRows(left, right, input.leftKey, input.rightKey ?? input.leftKey, input.join ?? "inner");
+        writeRows(outputPath, merged, "Merged");
+        return [
+          `Merged tables: ${merged.length} row(s)`,
+          `Left: ${leftPath} (${left.length} rows)`,
+          `Right: ${rightPath} (${right.length} rows)`,
+          `Join: ${input.join ?? "inner"} on ${input.leftKey} = ${input.rightKey ?? input.leftKey}`,
+          `Output: ${outputPath}`,
+          `Artifact: ${outputPath}`,
+        ].join("\n");
+      },
+    }),
+
+    data_report_template: tool({
+      description: [
+        "Create or return a structured report template based on source profiles and desired sections.",
+        "Use before create_report when the report structure is unclear.",
+      ].join("\n"),
+      inputSchema: dataReportTemplateSchema,
+      execute: async (input: z.infer<typeof dataReportTemplateSchema>) => {
+        const sections = input.sections?.length
+          ? input.sections
+          : ["Executive summary", "Sources inspected", "Key findings", "Data quality notes", "Recommended next steps"];
+        const markdown = [
+          `# ${input.title}`,
+          "",
+          "## Executive summary",
+          "",
+          "<write the concise answer here after inspecting source evidence>",
+          "",
+          ...sections
+            .filter((section) => section.toLowerCase() !== "executive summary")
+            .flatMap((section) => [
+              `## ${section}`,
+              "",
+              section.toLowerCase().includes("source")
+                ? (input.sources?.map((source) => `- ${source}`).join("\n") || "- <source path>")
+                : "- <evidence-backed note>",
+              "",
+            ]),
+        ].join("\n").trimEnd() + "\n";
+        if (!input.outputPath) return markdown;
+        const outputPath = resolveOutputPath(ctx.cwd, input.outputPath);
+        const consent = await guardWrite(ctx, "data_report_template", outputPath, input.overwrite);
+        if (consent) return consent;
+        mkdirSync(dirname(outputPath), { recursive: true });
+        writeFileSync(outputPath, markdown, "utf-8");
+        return `Created report template: ${outputPath}\nSections: ${sections.length}\nArtifact: ${outputPath}`;
       },
     }),
 
@@ -333,6 +525,238 @@ function tablePreview(rows: Record<string, unknown>[]): string {
     ...rows.slice(0, 20).map((row) => columns.map((column) => String(row[column] ?? "").slice(0, 80)).join(" | ")),
   ];
   return lines.join("\n");
+}
+
+async function profileDataPath(path: string, sampleRows: number): Promise<string> {
+  if (!existsSync(path)) return `Path: ${path}\nStatus: missing`;
+  const stat = statSync(path);
+  if (stat.isDirectory()) return `Path: ${path}\nStatus: directory (data_profile expects files)\nSize: ${formatBytes(stat.size)}`;
+  const ext = extname(path).toLowerCase();
+  const lines = [
+    `Path: ${path}`,
+    `Type: ${ext || "unknown"}`,
+    `Size: ${formatBytes(stat.size)}`,
+    `Modified: ${new Date(stat.mtimeMs).toISOString()}`,
+  ];
+  try {
+    if (ext === ".pdf") {
+      const pdf = await getPdf(path);
+      const { text, totalPages } = await extractText(pdf, { mergePages: true });
+      const body = Array.isArray(text) ? text.join("\n\n") : text;
+      lines.push(`Pages: ${totalPages}`, `Characters sampled: ${Math.min(body.length, 2000)}`);
+      lines.push("", body.slice(0, 2000));
+    } else if (ext === ".docx") {
+      const result = await mammoth.extractRawText({ path });
+      lines.push(`Characters: ${result.value.length}`, "", result.value.slice(0, 2000));
+    } else if (ext === ".xlsx" || ext === ".xls" || isTableExt(ext) || ext === ".json") {
+      const rows = readTable(path, undefined, undefined, sampleRows);
+      lines.push(`Rows sampled: ${rows.length}`, `Columns: ${collectColumns(rows).join(", ") || "(none)"}`, "", tablePreview(rows));
+    } else {
+      const text = readFileSync(path, "utf-8");
+      lines.push(`Characters: ${text.length}`, `Lines: ${text.split(/\r?\n/).length}`, "", text.slice(0, 2000));
+    }
+  } catch (err) {
+    lines.push(`Profile error: ${(err as Error).message}`);
+  }
+  return lines.join("\n");
+}
+
+function renderSchemaInference(path: string, rows: Record<string, unknown>[]): string {
+  const columns = collectColumns(rows);
+  const lines = [
+    `Schema inference: ${path}`,
+    `Rows sampled: ${rows.length}`,
+    `Columns: ${columns.length}`,
+    "",
+  ];
+  for (const column of columns) {
+    const values = rows.map((row) => row[column]);
+    const nonEmpty = values.filter((value) => !isEmptyValue(value));
+    const type = inferColumnType(nonEmpty);
+    const distinct = new Set(nonEmpty.map((value) => String(value))).size;
+    lines.push(`- ${column}`);
+    lines.push(`  type: ${type}`);
+    lines.push(`  nonEmpty: ${nonEmpty.length}/${values.length}`);
+    lines.push(`  distinct: ${distinct}`);
+    const samples = [...new Set(nonEmpty.map((value) => String(value)).filter(Boolean))].slice(0, 5);
+    if (samples.length) lines.push(`  samples: ${samples.join(", ")}`);
+    if (type === "number") {
+      const nums = nonEmpty.map((value) => Number(value)).filter((value) => Number.isFinite(value));
+      if (nums.length) {
+        lines.push(`  min: ${Math.min(...nums)}`);
+        lines.push(`  max: ${Math.max(...nums)}`);
+        lines.push(`  avg: ${Math.round((nums.reduce((sum, value) => sum + value, 0) / nums.length) * 100) / 100}`);
+      }
+    }
+  }
+  lines.push("", "Structured schema:");
+  lines.push(JSON.stringify(columns.map((column) => columnProfile(column, rows)), null, 2));
+  return lines.join("\n");
+}
+
+function columnProfile(column: string, rows: Record<string, unknown>[]): Record<string, unknown> {
+  const values = rows.map((row) => row[column]);
+  const nonEmpty = values.filter((value) => !isEmptyValue(value));
+  return {
+    column,
+    type: inferColumnType(nonEmpty),
+    rowCount: rows.length,
+    nonEmpty: nonEmpty.length,
+    empty: rows.length - nonEmpty.length,
+    distinct: new Set(nonEmpty.map((value) => String(value))).size,
+    samples: [...new Set(nonEmpty.map((value) => String(value)).filter(Boolean))].slice(0, 8),
+  };
+}
+
+function inferColumnType(values: unknown[]): "empty" | "boolean" | "number" | "date" | "string" | "mixed" {
+  if (!values.length) return "empty";
+  const bool = values.filter((value) => /^(true|false|yes|no|0|1)$/i.test(String(value).trim())).length;
+  const nums = values.filter((value) => String(value).trim() !== "" && Number.isFinite(Number(value))).length;
+  const dates = values.filter((value) => {
+    const text = String(value).trim();
+    return text.length >= 6 && !Number.isFinite(Number(text)) && Number.isFinite(Date.parse(text));
+  }).length;
+  const threshold = Math.max(1, Math.floor(values.length * 0.8));
+  if (bool >= threshold) return "boolean";
+  if (nums >= threshold) return "number";
+  if (dates >= threshold) return "date";
+  if (bool || nums || dates) return "mixed";
+  return "string";
+}
+
+function isEmptyValue(value: unknown): boolean {
+  return value === undefined || value === null || String(value).trim() === "";
+}
+
+function queryRows(rows: Record<string, unknown>[], input: z.infer<typeof dataQueryTableSchema>): Record<string, unknown>[] {
+  let result = rows.filter((row) => (input.where ?? []).every((condition) => matchCondition(row, condition)));
+  if (input.orderBy) {
+    const direction = input.order === "desc" ? -1 : 1;
+    result = [...result].sort((a, b) => compareValues(a[input.orderBy!], b[input.orderBy!]) * direction);
+  }
+  if (input.select?.length) {
+    result = result.map((row) => Object.fromEntries(input.select!.map((column) => [column, row[column] ?? ""])));
+  }
+  return result.slice(0, input.limit ?? 100);
+}
+
+function matchCondition(row: Record<string, unknown>, condition: DataQueryCondition): boolean {
+  const raw = row[condition.column];
+  const text = String(raw ?? "");
+  const expected = condition.value;
+  if (condition.op === "empty") return isEmptyValue(raw);
+  if (condition.op === "not_empty") return !isEmptyValue(raw);
+  if (condition.op === "contains") return text.toLowerCase().includes(String(expected ?? "").toLowerCase());
+  if (condition.op === "eq") return text === String(expected ?? "");
+  if (condition.op === "neq") return text !== String(expected ?? "");
+  const actualNumber = Number(raw);
+  const expectedNumber = Number(expected);
+  if (!Number.isFinite(actualNumber) || !Number.isFinite(expectedNumber)) return false;
+  if (condition.op === "gt") return actualNumber > expectedNumber;
+  if (condition.op === "gte") return actualNumber >= expectedNumber;
+  if (condition.op === "lt") return actualNumber < expectedNumber;
+  if (condition.op === "lte") return actualNumber <= expectedNumber;
+  return false;
+}
+
+function compareValues(a: unknown, b: unknown): number {
+  const an = Number(a);
+  const bn = Number(b);
+  if (Number.isFinite(an) && Number.isFinite(bn)) return an - bn;
+  return String(a ?? "").localeCompare(String(b ?? ""));
+}
+
+function mergeRows(
+  left: Record<string, unknown>[],
+  right: Record<string, unknown>[],
+  leftKey: string,
+  rightKey: string,
+  joinType: "inner" | "left",
+): Record<string, unknown>[] {
+  const rightIndex = new Map<string, Record<string, unknown>[]>();
+  for (const row of right) {
+    const key = String(row[rightKey] ?? "");
+    if (!rightIndex.has(key)) rightIndex.set(key, []);
+    rightIndex.get(key)!.push(row);
+  }
+  const merged: Record<string, unknown>[] = [];
+  for (const leftRow of left) {
+    const matches = rightIndex.get(String(leftRow[leftKey] ?? ""));
+    if (!matches?.length) {
+      if (joinType === "left") merged.push(prefixRow("left", leftRow));
+      continue;
+    }
+    for (const rightRow of matches) {
+      merged.push({
+        ...prefixRow("left", leftRow),
+        ...prefixRow("right", rightRow),
+      });
+    }
+  }
+  return merged;
+}
+
+function prefixRow(prefix: string, row: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(row).map(([key, value]) => [`${prefix}.${key}`, value]));
+}
+
+function summarizeRows(path: string, rows: Record<string, unknown>[], groupBy: string[]): string {
+  const columns = collectColumns(rows);
+  const lines = [
+    `Table summary: ${path}`,
+    `Rows sampled: ${rows.length}`,
+    `Columns: ${columns.length}`,
+    "",
+    "Column summaries:",
+  ];
+  for (const column of columns) {
+    const profile = columnProfile(column, rows);
+    lines.push(`- ${column}: ${profile.type}, non-empty ${profile.nonEmpty}/${profile.rowCount}, distinct ${profile.distinct}`);
+    const type = String(profile.type);
+    const values = rows.map((row) => row[column]).filter((value) => !isEmptyValue(value));
+    if (type === "number") {
+      const nums = values.map((value) => Number(value)).filter((value) => Number.isFinite(value));
+      if (nums.length) {
+        lines.push(`  min=${Math.min(...nums)} max=${Math.max(...nums)} avg=${Math.round((nums.reduce((sum, value) => sum + value, 0) / nums.length) * 100) / 100}`);
+      }
+    } else {
+      lines.push(`  top=${topValues(values).join(", ") || "(none)"}`);
+    }
+  }
+  if (groupBy.length) {
+    lines.push("", "Group counts:");
+    for (const group of groupBy) {
+      const counts = new Map<string, number>();
+      for (const row of rows) {
+        const key = String(row[group] ?? "");
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+      lines.push(`- ${group}`);
+      for (const [key, count] of [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20)) {
+        lines.push(`  ${key || "(empty)"}: ${count}`);
+      }
+    }
+  }
+  lines.push("", "Data quality notes:");
+  const sparse = columns
+    .map((column) => columnProfile(column, rows))
+    .filter((profile) => typeof profile.empty === "number" && profile.rowCount && Number(profile.empty) / Number(profile.rowCount) > 0.5)
+    .map((profile) => profile.column);
+  lines.push(sparse.length ? `- Sparse columns over 50% empty: ${sparse.join(", ")}` : "- No columns sampled over 50% empty.");
+  return lines.join("\n");
+}
+
+function topValues(values: unknown[]): string[] {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    const key = String(value ?? "");
+    if (!key) continue;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 5)
+    .map(([value, count]) => `${value} (${count})`);
 }
 
 async function guardWrite(

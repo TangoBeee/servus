@@ -11,7 +11,7 @@ import { bus } from "../events.js";
 import { createDesktopToolsWithContext } from "../tools-desktop.js";
 import type { Engine, EngineContext, EngineResult } from "../engine.js";
 import { SERVUS_OPERATING_LOOP } from "../prompts/operating-loop.js";
-import { runValidatedAgentTask } from "../agentic-loop.js";
+import { runDomainWorkflowRuntime } from "../domain-workflow-runtime.js";
 
 // ─── Desktop System Prompt ──────────────────────────────────────────────────
 
@@ -30,12 +30,16 @@ ${SERVUS_OPERATING_LOOP}
    - Use \`desktop_search\` to find ranked candidates by name, type, and recency
    - Use \`desktop_select_candidate\` to select and verify a candidate by id
    - Use \`desktop_inspect_path\` and \`desktop_verify_action\` to prove exact paths and postconditions
+   - Use \`desktop_preview\` before opening/moving/reporting files when contents or directory context matter
+   - Use \`desktop_recent\` for latest/recent-file requests
    - Use \`spotlight\` only as a fallback; never choose the first raw result without verification
    - Use \`glob\` and \`grep\` for precise pattern matching
    - Use \`ls\` to browse directory contents
 
 2. **File Operations**
    - Use \`file_move\` to move or rename files/folders
+   - Use \`file_copy\` to copy files/folders after exact source/destination planning
+   - Use \`desktop_operation_plan\` or \`desktop_batch_plan\` before mutating file operations
    - Use \`trash\` to safely delete files (moves to system Trash)
    - Ask for a different engine if the task requires broad shell scripting or code edits
 
@@ -97,6 +101,7 @@ export class DesktopEngine implements Engine {
         role: "file-manager",
         color: ANSI.cyan,
         model: ctx.model,
+        domain: "desktop",
         prompt: DESKTOP_PROMPT,
         extraTools: desktopTools as Record<string, unknown>,
         disallowedTools: ["bash", "write", "edit", "patch", "webfetch"],
@@ -109,10 +114,18 @@ export class DesktopEngine implements Engine {
 
       const home = process.env.HOME ?? "/tmp";
 
-      const result = await runValidatedAgentTask({
+      const result = await runDomainWorkflowRuntime({
         agent: this.agent,
         ctx,
         domain: "desktop",
+        progressRequired: true,
+        plan: [
+          "Search cwd first, then home if needed.",
+          "Inspect, preview, or rank candidates before acting.",
+          "Plan risky operations before mutation.",
+          "Verify the exact postcondition before completion.",
+        ],
+        evidenceTypes: ["desktop_candidate", "path_preview", "postcondition"],
         initialMessage:
         [
           "## Task",

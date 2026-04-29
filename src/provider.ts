@@ -5,7 +5,7 @@
  * Google Gemini, and any OpenAI-compatible API (Ollama, Together, etc.).
  *
  * Model strings follow the format "provider:model-id" or can be
- * auto-detected from well-known prefixes (gpt-*, claude-*, gemini-*).
+ * auto-detected from well-known provider model prefixes.
  */
 
 import type { LanguageModel } from "ai";
@@ -30,6 +30,12 @@ export interface ModelOption {
   label: string;
   description: string;
   recommended?: boolean;
+  inputPerM: number;
+  outputPerM: number;
+  cachedInputPerM?: number;
+  contextWindow?: number;
+  maxOutput?: number;
+  pricingNote?: string;
   available: boolean;
 }
 
@@ -86,64 +92,176 @@ const PROVIDERS: Record<string, ProviderEntry> = {
 const MODEL_CATALOG: Array<Omit<ModelOption, "providerName" | "available">> = [
   {
     provider: "anthropic",
-    id: "claude-sonnet-4-20250514",
-    value: "claude-sonnet-4-20250514",
-    label: "Claude Sonnet 4",
-    description: "Strong default for coding, planning, and agentic edits.",
+    id: "claude-sonnet-4-6",
+    value: "claude-sonnet-4-6",
+    label: "Sonnet 4.6",
+    description: "Best Anthropic balance for coding agents, planning, and long-context edits.",
     recommended: true,
+    inputPerM: 3,
+    outputPerM: 15,
+    cachedInputPerM: 0.3,
+    contextWindow: 1_000_000,
+    maxOutput: 64_000,
   },
   {
     provider: "anthropic",
-    id: "claude-3-5-sonnet-latest",
-    value: "claude-3-5-sonnet-latest",
-    label: "Claude 3.5 Sonnet",
-    description: "Fast fallback Anthropic model when available on the account.",
+    id: "claude-opus-4-7",
+    value: "claude-opus-4-7",
+    label: "Opus 4.7",
+    description: "Most capable provider model for complex reasoning and agentic coding.",
+    inputPerM: 5,
+    outputPerM: 25,
+    cachedInputPerM: 0.5,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+  },
+  {
+    provider: "anthropic",
+    id: "claude-haiku-4-5-20251001",
+    value: "claude-haiku-4-5-20251001",
+    label: "Haiku 4.5",
+    description: "Fast Anthropic model for lightweight turns and helper agents.",
+    inputPerM: 1,
+    outputPerM: 5,
+    cachedInputPerM: 0.1,
+    contextWindow: 200_000,
+    maxOutput: 64_000,
   },
   {
     provider: "openai",
-    id: "gpt-4o",
-    value: "gpt-4o",
-    label: "GPT-4o",
-    description: "Balanced OpenAI default for coding and automation.",
+    id: "gpt-5.4",
+    value: "gpt-5.4",
+    label: "GPT-5.4",
+    description: "Recommended OpenAI default for coding and professional agent work.",
     recommended: true,
+    inputPerM: 2.5,
+    outputPerM: 15,
+    cachedInputPerM: 0.25,
+    contextWindow: 1_050_000,
+    maxOutput: 128_000,
+    pricingNote: "Long context pricing applies above 272K input tokens.",
   },
   {
     provider: "openai",
-    id: "gpt-4.1",
-    value: "gpt-4.1",
-    label: "GPT-4.1",
-    description: "Higher-capability OpenAI model for larger coding tasks.",
+    id: "gpt-5.5",
+    value: "gpt-5.5",
+    label: "GPT-5.5",
+    description: "Highest-capability OpenAI model for difficult coding and research.",
+    inputPerM: 5,
+    outputPerM: 30,
+    cachedInputPerM: 0.5,
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
   },
   {
     provider: "openai",
-    id: "gpt-4.1-mini",
-    value: "gpt-4.1-mini",
-    label: "GPT-4.1 Mini",
-    description: "Lower-cost OpenAI model for simpler tasks.",
+    id: "gpt-5.4-mini",
+    value: "gpt-5.4-mini",
+    label: "GPT-5.4 Mini",
+    description: "Cost-effective OpenAI model for helpers, routine coding, and automation.",
+    inputPerM: 0.75,
+    outputPerM: 4.5,
+    cachedInputPerM: 0.075,
+    contextWindow: 400_000,
+    maxOutput: 128_000,
   },
   {
     provider: "openai",
-    id: "gpt-4o-mini",
-    value: "gpt-4o-mini",
-    label: "GPT-4o Mini",
-    description: "Fast low-cost OpenAI fallback.",
+    id: "gpt-5.2",
+    value: "gpt-5.2",
+    label: "GPT-5.2",
+    description: "Strong OpenAI coding and agentic model with broad API support.",
+    inputPerM: 1.75,
+    outputPerM: 14,
+    cachedInputPerM: 0.175,
+    contextWindow: 400_000,
+    maxOutput: 128_000,
+  },
+  {
+    provider: "openai",
+    id: "gpt-5.4-nano",
+    value: "gpt-5.4-nano",
+    label: "GPT-5.4 Nano",
+    description: "Cheapest GPT-5.4-class OpenAI model for classification, extraction, ranking, and subagents.",
+    inputPerM: 0.2,
+    outputPerM: 1.25,
+    cachedInputPerM: 0.02,
+    contextWindow: 400_000,
+    maxOutput: 128_000,
+  },
+  {
+    provider: "google",
+    id: "gemini-3-flash-preview",
+    value: "gemini-3-flash-preview",
+    label: "Gemini 3 Flash Preview",
+    description: "Recommended Google default for fast frontier coding and agent work.",
+    recommended: true,
+    inputPerM: 0.5,
+    outputPerM: 3,
+    cachedInputPerM: 0.05,
+    contextWindow: 1_048_576,
+    maxOutput: 65_536,
+  },
+  {
+    provider: "google",
+    id: "gemini-3-pro-preview",
+    value: "gemini-3-pro-preview",
+    label: "Gemini 3 Pro Preview",
+    description: "Google's strongest Gemini 3 model for multimodal and agentic reasoning.",
+    inputPerM: 2,
+    outputPerM: 12,
+    cachedInputPerM: 0.2,
+    contextWindow: 1_048_576,
+    maxOutput: 65_536,
+    pricingNote: "$2/$12 up to 200k input tokens; $4/$18 above 200k.",
   },
   {
     provider: "google",
     id: "gemini-2.5-pro",
     value: "gemini-2.5-pro",
     label: "Gemini 2.5 Pro",
-    description: "Strong Google model for coding and research.",
-    recommended: true,
+    description: "Stable Google thinking model for complex code, data, and research tasks.",
+    inputPerM: 1.25,
+    outputPerM: 10,
+    cachedInputPerM: 0.31,
+    contextWindow: 1_048_576,
+    maxOutput: 65_536,
   },
   {
     provider: "google",
-    id: "gemini-2.5-flash",
-    value: "gemini-2.5-flash",
-    label: "Gemini 2.5 Flash",
-    description: "Fast Google model for routine automation.",
+    id: "gemini-2.5-flash-preview-09-2025",
+    value: "gemini-2.5-flash-preview-09-2025",
+    label: "Gemini 2.5 Flash Preview",
+    description: "High-volume, low-latency Google model with thinking support.",
+    inputPerM: 0.3,
+    outputPerM: 2.5,
+    cachedInputPerM: 0.03,
+    contextWindow: 1_048_576,
+    maxOutput: 65_536,
+  },
+  {
+    provider: "google",
+    id: "gemini-2.5-flash-lite-preview-09-2025",
+    value: "gemini-2.5-flash-lite-preview-09-2025",
+    label: "Gemini 2.5 Flash-Lite Preview",
+    description: "Lowest-cost Google model for small helper and automation turns.",
+    inputPerM: 0.1,
+    outputPerM: 0.4,
+    cachedInputPerM: 0.01,
+    contextWindow: 1_048_576,
+    maxOutput: 65_536,
   },
 ];
+
+const STALE_BUNDLED_DEFAULTS = new Set([
+  "claude-sonnet-4-20250514",
+  "claude-3-5-sonnet-latest",
+  "gpt-4o",
+  "gpt-4o-mini",
+  "gpt-5-mini",
+  "gpt-5-nano",
+  "gemini-2.5-flash",
+]);
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -161,13 +279,13 @@ export interface ResolvedModel {
  *   "model-id"                   → auto-detect from prefix
  *
  * Examples:
- *   "openai:gpt-4o"
- *   "anthropic:claude-sonnet-4-20250514"
- *   "google:gemini-2.5-pro"
+ *   "openai:gpt-5.4"
+ *   "anthropic:<model-id>"
+ *   "google:gemini-3-flash-preview"
  *   "openai-compatible:my-local-model"
- *   "gpt-4o"                     → auto-detects openai
- *   "claude-sonnet-4-20250514"   → auto-detects anthropic
- *   "gemini-2.5-flash"           → auto-detects google
+ *   "gpt-5.4"                    → auto-detects openai
+ *   provider-native model ids     → auto-detected when their prefix is known
+ *   "gemini-3-flash-preview"     → auto-detects google
  */
 export function resolveModel(
   modelString: string,
@@ -277,12 +395,47 @@ export function listModelOptions(opts: { includeUnavailable?: boolean } = {}): M
 }
 
 export function getDefaultModelForAvailableProvider(configuredDefault?: string): string {
-  if (configuredDefault) {
+  if (configuredDefault && !STALE_BUNDLED_DEFAULTS.has(configuredDefault)) {
     const provider = inferProviderForModel(configuredDefault);
     if (provider && hasProviderAccess(provider)) return configuredDefault;
   }
 
   const available = listModelOptions();
   const recommended = available.find((model) => model.recommended);
-  return recommended?.value ?? available[0]?.value ?? configuredDefault ?? "gpt-4o";
+  return recommended?.value ?? available[0]?.value ?? configuredDefault ?? "gpt-5.4";
+}
+
+export function pricingForModel(provider: string, modelId: string): {
+  inputPerM: number;
+  outputPerM: number;
+  cachedInputPerM?: number;
+} {
+  const normalized = modelId.toLowerCase();
+  const exact = MODEL_CATALOG.find((model) =>
+    model.provider === provider &&
+    (model.id.toLowerCase() === normalized || model.value.toLowerCase() === normalized)
+  );
+  if (exact) {
+    return {
+      inputPerM: exact.inputPerM,
+      outputPerM: exact.outputPerM,
+      ...(exact.cachedInputPerM !== undefined ? { cachedInputPerM: exact.cachedInputPerM } : {}),
+    };
+  }
+
+  const prefix = MODEL_CATALOG.find((model) =>
+    model.provider === provider && normalized.startsWith(model.id.toLowerCase())
+  );
+  if (prefix) {
+    return {
+      inputPerM: prefix.inputPerM,
+      outputPerM: prefix.outputPerM,
+      ...(prefix.cachedInputPerM !== undefined ? { cachedInputPerM: prefix.cachedInputPerM } : {}),
+    };
+  }
+
+  if (provider === "openai") return { inputPerM: 2.5, outputPerM: 15, cachedInputPerM: 0.25 };
+  if (provider === "anthropic") return { inputPerM: 3, outputPerM: 15, cachedInputPerM: 0.3 };
+  if (provider === "google") return { inputPerM: 0.5, outputPerM: 3, cachedInputPerM: 0.05 };
+  return { inputPerM: 3, outputPerM: 15 };
 }

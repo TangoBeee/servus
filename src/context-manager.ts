@@ -31,17 +31,19 @@ const DEFAULT_COMPACT_RATIO = 0.62;
 export function contextBudgetForModel(modelId: string): ContextBudget {
   const normalized = modelId.toLowerCase();
   const contextWindowTokens =
-    normalized.startsWith("gpt-4.1")
-      ? 1_000_000
-      : normalized.startsWith("gpt-5")
-        ? 400_000
+    normalized.startsWith("gpt-5")
+      ? 400_000
+      : normalized.startsWith("gpt-4.1")
+        ? 1_000_000
         : normalized.startsWith("gpt-4o")
           ? 128_000
-          : normalized.startsWith("claude-")
-            ? 200_000
-            : normalized.includes("gemini-2.5")
-              ? 1_000_000
-              : DEFAULT_CONTEXT_WINDOW;
+          : normalized.startsWith("claude-opus-4-7") || normalized.startsWith("claude-sonnet-4-6")
+            ? 1_000_000
+            : normalized.startsWith("claude-")
+              ? 200_000
+              : normalized.includes("gemini-3") || normalized.includes("gemini-2.5")
+                ? 1_000_000
+                : DEFAULT_CONTEXT_WINDOW;
 
   const compactAtTokens = Math.max(
     16_000,
@@ -84,9 +86,19 @@ export function agentSessionDir(sessionId: string, agent: string): string {
   return join(SERVUS_DIR, "agent-sessions", sanitize(sessionId), sanitize(agent));
 }
 
+function sessionScopedAgentDir(sessionId: string, agent: string): string {
+  return join(SERVUS_DIR, "sessions", sanitize(sessionId), "coding", "agents", sanitize(agent));
+}
+
+function sessionScopedAgentHistoryPath(sessionId: string, agent: string): string {
+  return join(sessionScopedAgentDir(sessionId, agent), "history.json");
+}
+
 export function loadAgentHistory(sessionId: string | undefined, agent: string): ModelMessage[] {
   if (!sessionId) return [];
-  const path = agentHistoryPath(sessionId, agent);
+  const path = existsSync(sessionScopedAgentHistoryPath(sessionId, agent))
+    ? sessionScopedAgentHistoryPath(sessionId, agent)
+    : agentHistoryPath(sessionId, agent);
   if (!existsSync(path)) return [];
   try {
     const parsed = JSON.parse(readFileSync(path, "utf-8")) as Partial<AgentHistoryRecord>;
@@ -114,6 +126,9 @@ export function saveAgentHistory(
     estimatedTokens,
   };
   writeFileSync(agentHistoryPath(sessionId, agent), JSON.stringify(record, null, 2) + "\n");
+  const scopedDir = sessionScopedAgentDir(sessionId, agent);
+  mkdirSync(scopedDir, { recursive: true });
+  writeFileSync(sessionScopedAgentHistoryPath(sessionId, agent), JSON.stringify(record, null, 2) + "\n");
 }
 
 export function appendCompactionLog(
@@ -125,6 +140,13 @@ export function appendCompactionLog(
   const dir = agentSessionDir(sessionId, agent);
   mkdirSync(dir, { recursive: true });
   appendFileSync(join(dir, "compactions.jsonl"), JSON.stringify({ timestamp: Date.now(), ...entry }) + "\n");
+  const scopedDir = sessionScopedAgentDir(sessionId, agent);
+  mkdirSync(scopedDir, { recursive: true });
+  const record = JSON.stringify({ timestamp: Date.now(), agent, ...entry }) + "\n";
+  appendFileSync(join(scopedDir, "compactions.jsonl"), record);
+  const codingDir = join(SERVUS_DIR, "sessions", sanitize(sessionId), "coding");
+  mkdirSync(codingDir, { recursive: true });
+  appendFileSync(join(codingDir, "compactions.jsonl"), record);
 }
 
 function sanitize(value: string): string {
