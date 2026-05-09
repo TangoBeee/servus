@@ -28,94 +28,10 @@ const ASCII_SHIELD = `
    [ DOMAIN TOOLS ]
 `;
 
-const ASCII_PLANE = `              .------,
-              =\\      \\
- .---.         =\\      \\
- | C~ \\         =\\      \\
- |     \`----------'------'----------,
-.'     LI.-.LI LI LI LI LI LI LI.-.LI\`-.
-\\ _/.____|_|______.------,______|_|_____)
-                 /      /
-               =/      /
-              =/      /
-             =/      /
-             /_____,'`;
-
-const ASCII_NUKE = `⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⠠⠒⢂⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⣙⣄⠀⠀⠱⡀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡠⠤⠾⣻⢂⠀⠀⠐⠄⠀
-⠀⠀⠀⠀⠀⠀⠀⡠⠐⠨⡁⠀⠀⠀⠀⠙⣖⣥⡀⠀⠈⢆
-⠀⠀⠀⠀⡠⠐⠁⠀⠀⠀⠐⠄⠀⠀⠀⡠⠊⠹⡑⡤⠐⠉
-⠀⡠⢆⠁⠀⢠⢆⣗⢦⠀⠀⠈⢂⢀⠔⠀⠀⠀⠀⠀⠀⠀
-⡘⠀⠈⢢⠀⠘⠯⠭⠟⠀⠀⡠⠔⠁⠀⠀⠀⠀⠀⠀⠀⠀
-⢃⠀⠀⠀⠱⡀⠀⠀⡠⠐⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠢⠄⣀⣀⠰⠐⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀`;
-
-
-// --- Synthetic Audio Engine ---
-const playPropellerSound = (ctx, duration) => {
-  const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-  osc.type = 'sawtooth';
-  osc.frequency.setValueAtTime(40, ctx.currentTime);
-  osc.frequency.linearRampToValueAtTime(45, ctx.currentTime + duration / 2);
-  osc.frequency.linearRampToValueAtTime(35, ctx.currentTime + duration);
-
-  gain.gain.setValueAtTime(0, ctx.currentTime);
-  gain.gain.linearRampToValueAtTime(0.5, ctx.currentTime + duration / 2);
-  gain.gain.linearRampToValueAtTime(0, ctx.currentTime + duration);
-
-  osc.connect(gain);
-  gain.connect(ctx.destination);
-  osc.start(ctx.currentTime);
-  osc.stop(ctx.currentTime + duration);
-};
-
-const playBombDropSound = (ctx, duration) => {
-  const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-  osc.type = 'sine';
-  osc.frequency.setValueAtTime(800, ctx.currentTime);
-  osc.frequency.exponentialRampToValueAtTime(100, ctx.currentTime + duration);
-
-  gain.gain.setValueAtTime(0.1, ctx.currentTime);
-  gain.gain.linearRampToValueAtTime(0.5, ctx.currentTime + duration);
-
-  osc.connect(gain);
-  gain.connect(ctx.destination);
-  osc.start(ctx.currentTime);
-  osc.stop(ctx.currentTime + duration);
-};
-
-const playExplosionSound = (ctx) => {
-  const bufferSize = ctx.sampleRate * 2.5;
-  const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
-  const data = buffer.getChannelData(0);
-  for (let i = 0; i < bufferSize; i++) {
-    data[i] = Math.random() * 2 - 1;
-  }
-  const noiseSource = ctx.createBufferSource();
-  noiseSource.buffer = buffer;
-
-  const filter = ctx.createBiquadFilter();
-  filter.type = 'lowpass';
-  filter.frequency.setValueAtTime(1000, ctx.currentTime);
-  filter.frequency.exponentialRampToValueAtTime(10, ctx.currentTime + 2.5);
-
-  const gain = ctx.createGain();
-  gain.gain.setValueAtTime(1, ctx.currentTime);
-  gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 2.5);
-
-  noiseSource.connect(filter);
-  filter.connect(gain);
-  gain.connect(ctx.destination);
-  noiseSource.start();
-};
-
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
 function Console({
-  onClose, history, setHistory, commandHistory, setCommandHistory, isRoot, setIsRoot, setIsHacked, setIsNuking, audioRef, isPlaying, setIsPlaying, musicVolume, setMusicVolume
+  onClose, history, setHistory, commandHistory, setCommandHistory, audioRef, isPlaying, setIsPlaying, musicVolume, setMusicVolume
 }) {
   const [input, setInput] = useState('');
   const [historyIndex, setHistoryIndex] = useState(-1);
@@ -183,16 +99,15 @@ function Console({
       }
     } else if (e.key === 'Tab') {
       e.preventDefault();
-      const baseCommands = ['help', 'about', 'start', 'clear', 'echo', 'date', 'whoami', 'pwd', 'ls', 'cat', 'sudo', 'hack', 'ping', 'contact'];
-      const rootCommands = ['nuke'];
-      const availableCommands = isRoot ? [...baseCommands, ...rootCommands] : baseCommands;
+      const baseCommands = ['help', 'about', 'start', 'status', 'runtime', 'mcp', 'clear', 'echo', 'date', 'whoami', 'pwd', 'ls', 'cat', 'ping', 'contact'];
+      const availableCommands = baseCommands;
       const current = input.toLowerCase();
 
-      if (current === 'sudo ' || current === 'sudo s') { setInput('sudo su'); return; }
-      if (current === 'sudo r') { setInput('sudo rm -rf /'); return; }
+      if (current === 'sta') { setInput('status'); return; }
+      if (current === 'run') { setInput('runtime'); return; }
+      if (current === 'm') { setInput('mcp'); return; }
       if (current === 'ls ' || current === 'ls a') { setInput('ls agents/'); return; }
       if (current === 'cat ' || current === 'cat c') { setInput('cat config.json'); return; }
-      if (current === 'cat t' && isRoot) { setInput('cat top_secret_data.txt'); return; }
 
       const match = availableCommands.find(cmd => cmd.startsWith(current));
       if (match) setInput(match);
@@ -205,7 +120,7 @@ function Console({
     const cmd = input.trim();
     if (!cmd) return;
 
-    setHistory(prev => [...prev, { type: 'user', content: cmd, isRoot }]);
+    setHistory(prev => [...prev, { type: 'user', content: cmd }]);
     setCommandHistory(prev => [...prev, cmd]);
     setHistoryIndex(-1);
     setInput('');
@@ -214,18 +129,8 @@ function Console({
     const args = cmd.split(' ');
     const command = args[0].toLowerCase();
 
-    // Sudo Easter Eggs
-    if (command === 'sudo' && args[1] === 'su') {
-      setIsRoot(true);
-      setHistory(prev => [...prev, { type: 'system', content: 'Bypassing mainframe security... Access Granted. You are now root.' }]);
-    }
-    else if (command === 'sudo' && args[1] === 'rm' && args[2] === '-rf') {
-      setHistory(prev => [...prev, { type: 'system', content: 'Nice try! I am an AI, I don\'t have a physical filesystem to delete. 🤖 Nice prank though.' }]);
-    }
-
-    // Commands
-    else if (command === 'help') {
-      setHistory(prev => [...prev, { type: 'system', content: 'Commands: help, about, start, clear, echo, date, whoami, ls, cat, pwd, ping, hack, contact, music play, music stop, music volume <0-100>' + (isRoot ? ', nuke' : '') }]);
+    if (command === 'help') {
+      setHistory(prev => [...prev, { type: 'system', content: 'Commands: help, about, start, status, runtime, mcp, clear, echo, date, whoami, ls, cat, pwd, ping, contact, music play, music stop, music volume <0-100>' }]);
     } else if (command === 'clear') {
       setHistory([]);
     } else if (command === 'about') {
@@ -240,6 +145,12 @@ function Console({
       setHistory(prev => [...prev, { type: 'system', content: '[OK] Browser memory, skills/plugins, proof collection, and consent gates ready' }]);
       await delay(600);
       setHistory(prev => [...prev, { type: 'system', content: '=> READY. Tasks complete only when evidence satisfies the runtime contract.' }]);
+    } else if (command === 'status') {
+      setHistory(prev => [...prev, { type: 'system', content: '[OK] TUI: chat-first workspace\n[OK] MCP: stdio + Streamable HTTP + SSE config path\n[OK] Browser: persistent Playwright sessions\n[OK] Domains: coding, browser, desktop, media, data, security, extension, general' }]);
+    } else if (command === 'runtime') {
+      setHistory(prev => [...prev, { type: 'system', content: 'Servus runtime: session-owned tasks, tool metadata, consent gates, project memory, proof artifacts, and validated finalization.' }]);
+    } else if (command === 'mcp') {
+      setHistory(prev => [...prev, { type: 'system', content: 'MCP config sources:\n- ~/.servus/mcp.json\n- .servus/mcp.json\n- plugin manifests\n\nCommands in CLI/TUI: /mcp, /mcp test, /mcp tools, /mcp resources, /mcp prompts, /mcp auth status.' }]);
     } else if (command === 'ping') {
       const target = args[1] || 'tangobee.dev';
       setHistory(prev => [...prev, { type: 'system', content: `PING ${target} (HTTP HEAD): measuring latency` }]);
@@ -260,9 +171,9 @@ function Console({
     } else if (command === 'date') {
       setHistory(prev => [...prev, { type: 'system', content: new Date().toString() }]);
     } else if (command === 'whoami') {
-      setHistory(prev => [...prev, { type: 'system', content: isRoot ? 'root (Superuser)' : 'guest@servus-os' }]);
+      setHistory(prev => [...prev, { type: 'system', content: 'operator@servus-os' }]);
     } else if (command === 'pwd') {
-      setHistory(prev => [...prev, { type: 'system', content: isRoot ? '/root' : '/home/guest/servus' }]);
+      setHistory(prev => [...prev, { type: 'system', content: '/home/operator/servus' }]);
     } else if (command === 'ls') {
       const dir = args[1] ? args[1].replace(/\/$/, '') : '.';
       const fileSystem = {
@@ -273,7 +184,6 @@ function Console({
       };
       if (fileSystem[dir]) {
         let content = fileSystem[dir].join('  ');
-        if (isRoot && dir === '.') content += '  top_secret_data.txt';
         setHistory(prev => [...prev, { type: 'system', content }]);
       } else {
         setHistory(prev => [...prev, { type: 'system', content: `ls: cannot access '${args[1]}': No such file or directory` }]);
@@ -284,15 +194,9 @@ function Console({
         setHistory(prev => [...prev, { type: 'system', content: 'cat: missing file operand' }]);
       } else if (file === 'config.json') {
         setHistory(prev => [...prev, { type: 'system', content: `{\n  "name": "servus",\n  "version": "${__APP_VERSION__}",\n  "runtime": "strict-evidence",\n  "domains": ["coding", "browser", "desktop", "media", "data", "security", "extension", "general"]\n}` }]);
-      } else if (file === 'top_secret_data.txt') {
-        if (isRoot) setHistory(prev => [...prev, { type: 'system', content: 'TOP SECRET: The AI is actually just 10,000 nested if-statements. Shhh.' }]);
-        else setHistory(prev => [...prev, { type: 'system', content: 'cat: top_secret_data.txt: Permission denied' }]);
       } else {
         setHistory(prev => [...prev, { type: 'system', content: `cat: ${file}: No such file or directory` }]);
       }
-    } else if (command === 'hack') {
-      setIsHacked(true);
-      setHistory(prev => [...prev, { type: 'system', content: '>>> SAFE SIMULATION ONLY. No real systems touched.\nUnlocking hidden website components...' }]);
     } else if (command === 'contact') {
       setHistory(prev => [...prev, { type: 'system', content: '>>> Opening communication channel...\nEmail: tangobeee@gmail.com\nWebsite: https://tangobee.dev/servus\nGitHub: github.com/TangoBeee\nFeel free to reach out for Pro plans or customizations!' }]);
     } else if (command === 'music') {
@@ -322,15 +226,6 @@ function Console({
       } else {
         setHistory(prev => [...prev, { type: 'system', content: 'Music commands: play, stop, volume <0-100>' }]);
       }
-    } else if (command === 'nuke') {
-      if (isRoot) {
-        setHistory(prev => [...prev, { type: 'system', content: 'WARNING: TACTICAL NUKE INBOUND. DESTROYING UI...' }]);
-        await delay(1000);
-        onClose();
-        setIsNuking(true);
-      } else {
-        setHistory(prev => [...prev, { type: 'system', content: 'Permission denied. You must be root to nuke.' }]);
-      }
     } else {
       setHistory(prev => [...prev, { type: 'system', content: `Command not found: ${command}` }]);
     }
@@ -338,21 +233,21 @@ function Console({
     setIsProcessing(false);
   };
 
-  const promptChar = isRoot ? '#' : '$';
+  const promptChar = '$';
 
   return (
     <div className="console-overlay animating-in" style={{ left: position.x, top: position.y }}>
       <div className="console-header" onMouseDown={handleMouseDown}>
-        <span>~/servus/console {isRoot ? '[ROOT]' : ''}</span>
+        <span>~/servus/console</span>
         <span className="console-close" onMouseDown={(e) => { e.stopPropagation(); onClose(); }}>[X] CLOSE</span>
       </div>
       <div className="console-body" onClick={() => inputRef.current?.focus()}>
         {history.map((h, i) => (
           <div key={i} style={{ marginBottom: '4px' }}>
             {h.type === 'user' ? (
-              <div><span className="t-prompt">{h.isRoot ? '#' : '$'}</span>{h.content}</div>
+              <div><span className="t-prompt">$</span>{h.content}</div>
             ) : (
-              <div style={{ color: h.content?.toString().includes('Permission denied') || h.content?.toString().includes('error') ? 'var(--text-dim)' : 'inherit', whiteSpace: 'pre-wrap' }}>{h.content}</div>
+              <div style={{ color: h.content?.toString().includes('error') ? 'var(--text-dim)' : 'inherit', whiteSpace: 'pre-wrap' }}>{h.content}</div>
             )}
           </div>
         ))}
@@ -445,6 +340,16 @@ function PricingModal({ onClose, triggerContact }) {
 
 const BASE_DIRECTORY_FEED = [
   {
+    date: '2026.5.19',
+    title: 'Production Cleanup and TUI Stabilization',
+    content: 'The Servus CLI is being tightened for production use.\n\n- The TUI now centers around one full-screen composer, command autocomplete, and session-aware live runs.\n- Removed stale build artifacts from package output with a clean build step.\n- Browser, coding, and non-coding smoke scripts validate core runtime paths before publishing.\n- Provider/model selection stays provider-aware while still allowing custom model IDs.'
+  },
+  {
+    date: '2026.5.18',
+    title: 'Global MCP and Project Memory',
+    content: 'Servus treats local extensions and external tools as first-class runtime capabilities.\n\n- MCP servers can be configured from user, project, config, and plugin sources.\n- Project memory lives under ~/.servus/projects and can be updated through /remember and memory-aware coding sessions.\n- Skills, hooks, plugins, and custom commands use Servus-owned paths such as SERVUS.md and .servus/.\n- External tools remain permissioned and observable through the shared registry.'
+  },
+  {
     date: '2026.4.27',
     title: 'Runtime-First Agent Reliability',
     content: 'Servus now routes work through a stricter execution contract.\n\n- Domains use understand → discover → plan → act → verify → finalize loops.\n- servus_done and servus_need_input finalization require evidence, confidence, and satisfied criteria.\n- Completion is rejected when proof is missing, ambiguous, stale, or contradicted.\n- Sessions persist events, artifacts, evidence, proof directories, and runtime status.'
@@ -472,11 +377,6 @@ function App() {
   const [pricingOpen, setPricingOpen] = useState(false);
   const [expandedFeed, setExpandedFeed] = useState(null);
 
-  // Game states
-  const [isHacked, setIsHacked] = useState(false);
-  const [isNuking, setIsNuking] = useState(false);
-  const [nukeStage, setNukeStage] = useState(0);
-
   // Music states
   const [isPlaying, setIsPlaying] = useState(false);
   const [musicVolume, setMusicVolume] = useState(50);
@@ -489,25 +389,24 @@ function App() {
     { type: 'system', content: <br /> }
   ]);
   const [commandHistory, setCommandHistory] = useState([]);
-  const [isRoot, setIsRoot] = useState(false);
 
   const triggerContactTerminal = useCallback(() => {
     setConsoleOpen(true);
     setHistory(prev => [
       ...prev,
-      { type: 'user', content: 'contact', isRoot },
+      { type: 'user', content: 'contact' },
       { type: 'system', content: '>>> Opening communication channel...\nEmail: tangobeee@gmail.com\nWebsite: https://tangobee.dev/servus\nGitHub: github.com/TangoBeee\nFeel free to reach out for Pro plans or customizations!' }
     ]);
-  }, [isRoot]);
+  }, []);
 
   const triggerDocsTerminal = useCallback(() => {
     setConsoleOpen(true);
     setHistory(prev => [
       ...prev,
-      { type: 'user', content: 'cat docs/index.md', isRoot },
+      { type: 'user', content: 'cat docs/index.md' },
       { type: 'system', content: '>>> Documentation is being updated to match the new runtime, domain engines, skills/plugins, and proof system. [ COMING SOON ]' }
     ]);
-  }, [isRoot]);
+  }, []);
 
   useEffect(() => {
     const handleKey = (e) => {
@@ -524,67 +423,18 @@ function App() {
     return () => window.removeEventListener('keydown', handleKey);
   }, [triggerDocsTerminal]);
 
-  // Nuke Sequence Effect
-  useEffect(() => {
-    if (isNuking) {
-      const runNuke = async () => {
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-
-        setNukeStage(1); // Plane appears
-        playPropellerSound(audioCtx, 6);
-        await delay(3000); // Wait for plane to reach center
-
-        setNukeStage(2); // Bomb drops
-        playBombDropSound(audioCtx, 2.5);
-        await delay(2500);
-
-        setNukeStage(3); // Explosion white flash
-        playExplosionSound(audioCtx);
-        await delay(800);
-
-        setNukeStage(4); // Fatal error screen
-      };
-      runNuke();
-    }
-  }, [isNuking]);
-
   const handleReadFeed = (idx) => {
     setExpandedFeed(expandedFeed === idx ? null : idx);
   };
 
-  const DIRECTORY_FEED = isHacked
-    ? [{ date: '1970.1.1', title: '[TOP SECRET] RUNTIME DEBUG NOTE', content: 'CLASSIFIED: Website easter eggs are simulated. Real Servus runs stay scoped, consent-gated, and proof-checked before completion.' }, ...BASE_DIRECTORY_FEED]
-    : BASE_DIRECTORY_FEED;
-
-  if (nukeStage === 4) {
-    return (
-      <div style={{ background: '#000', color: '#f00', height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'monospace', fontSize: '2rem', textAlign: 'center', whiteSpace: 'pre-wrap' }}>
-        {`[ FATAL ERROR ]\n\n502 BAD GATEWAY\n\nSERVER HAS BEEN DESTROYED BY ROOT USER.`}
-      </div>
-    );
-  }
+  const DIRECTORY_FEED = BASE_DIRECTORY_FEED;
 
   return (
-    <div className={`app-wrapper ${isHacked ? 'hacked-mode' : ''}`}>
+    <div className="app-wrapper">
       <Toaster position="top-right" toastOptions={{ style: { fontSize: '0.875rem', borderRadius: '0.375rem' } }} />
       <audio ref={audioRef} src="/song.opus" style={{ display: 'none' }} onEnded={() => setIsPlaying(false)} />
       <div className="scanlines"></div>
       <div className="grid-bg"></div>
-
-      {isNuking && nukeStage < 4 && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, pointerEvents: 'all', background: nukeStage === 3 ? '#fff' : 'transparent', transition: 'background 0.5s' }}>
-          {nukeStage >= 1 && nukeStage < 3 && (
-            <pre style={{ position: 'absolute', top: '10%', color: '#fff', fontSize: '10px', fontWeight: 'bold', animation: 'fly 6s linear forwards', whiteSpace: 'pre', lineHeight: '1' }}>
-              {ASCII_PLANE}
-            </pre>
-          )}
-          {nukeStage >= 2 && nukeStage < 3 && (
-            <pre style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', color: '#fff', fontSize: '6px', fontWeight: 'bold', animation: 'drop 2.5s linear forwards', whiteSpace: 'pre', lineHeight: '1.2' }}>
-              {ASCII_NUKE}
-            </pre>
-          )}
-        </div>
-      )}
 
       <nav className="nav-bar">
         <div className="nav-links">
@@ -609,16 +459,16 @@ function App() {
             <h1 className="hero-title" style={{ position: 'relative' }}>
               Welcome to Servus<span className="pixel-box">OS</span>
             </h1>
-            <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.85rem', color: isHacked ? '#f00' : 'var(--text-dim)', marginBottom: '1.5rem', background: isHacked ? 'rgba(255,0,0,0.1)' : 'rgba(255,255,255,0.05)', display: 'inline-flex', padding: '0.2rem 0.5rem', alignItems: 'center', gap: '0.5rem' }}>
-              {isHacked ? '[ SYSTEM COMPROMISED ]' : <>[ <div style={{ display: 'inline-block', width: '0.5rem', height: '0.5rem', background: '#22c55e', borderRadius: '50%', boxShadow: '0 0 0.5rem #22c55e, inset 0 0 0.5rem rgba(34,197,94,0.5)', animation: 'pulse 2s infinite', margin: '0 0.25rem' }} /> IN ACTIVE DEVELOPMENT ]</>}
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.85rem', color: 'var(--text-dim)', marginBottom: '1.5rem', background: 'rgba(255,255,255,0.05)', display: 'inline-flex', padding: '0.2rem 0.5rem', alignItems: 'center', gap: '0.5rem' }}>
+              <>[ <div style={{ display: 'inline-block', width: '0.5rem', height: '0.5rem', background: '#22c55e', borderRadius: '50%', boxShadow: '0 0 0.5rem #22c55e, inset 0 0 0.5rem rgba(34,197,94,0.5)', animation: 'pulse 2s infinite', margin: '0 0.25rem' }} /> IN ACTIVE DEVELOPMENT ]</>
             </div>
             <p className="hero-desc">
-              Local-first AI operator for coding, browser workflows, desktop files, data/docs, media, security analysis, and custom skills/plugins — with proof-backed completion.
+              Local-first AI operator for coding, browser workflows, desktop files, data/docs, media, security analysis, MCP tools, project memory, and custom skills/plugins — with proof-backed completion.
             </p>
           </div>
           <div className="hero-right">
             <div className="badge-dev">V {__APP_VERSION__}</div>
-            <div className="ascii-globe" style={{ color: isHacked ? '#f00' : 'var(--text-dim)' }}>
+            <div className="ascii-globe" style={{ color: 'var(--text-dim)' }}>
               {ASCII_GLOBE}
             </div>
           </div>
@@ -718,23 +568,27 @@ function App() {
               <h3 style={{ marginBottom: '0.5rem', fontFamily: 'var(--font-mono)', fontSize: '0.9rem' }}>[ TOOL REGISTRY ]</h3>
               <p style={{ color: 'var(--text-dim)' }}>Tools carry domain, risk, read-only/mutating, consent, timeout, and artifact metadata so high-risk actions stay gated.</p>
             </div>
+            <div className="fig-box pulse-border" style={{ flexDirection: 'column', alignItems: 'flex-start', minHeight: 'auto', padding: '1.5rem' }}>
+              <h3 style={{ marginBottom: '0.5rem', fontFamily: 'var(--font-mono)', fontSize: '0.9rem' }}>[ MCP + MEMORY ]</h3>
+              <p style={{ color: 'var(--text-dim)' }}>Connect stdio, Streamable HTTP, and SSE MCP servers, then preserve useful project context in Servus memory without polluting the working tree.</p>
+            </div>
           </div>
         </div>
 
         <div className="directory-feed">
-          <div className="slash-header" style={{ color: isHacked ? '#f00' : 'inherit' }}><span>/</span> DIRECTORY FEED</div>
+          <div className="slash-header"><span>/</span> DIRECTORY FEED</div>
 
           {DIRECTORY_FEED.map((item, idx) => (
             <div key={idx}>
-              <div className="tree-row" onClick={() => handleReadFeed(idx)} style={{ color: item.title.includes('SECRET') ? '#f00' : 'inherit', borderBottom: item.title.includes('SECRET') ? '1px dashed #f00' : '' }}>
+              <div className="tree-row" onClick={() => handleReadFeed(idx)}>
                 <span className="tree-icon">{expandedFeed === idx ? '[-]' : '[+]'}</span>
-                <span className="tree-date" style={{ color: isHacked ? '#f00' : 'inherit' }}>{item.date}</span>
+                <span className="tree-date">{item.date}</span>
                 <span className="tree-name">{item.title}</span>
-                <span className="tree-action" style={{ color: isHacked ? '#f00' : 'var(--text-dim)' }}>{expandedFeed === idx ? '[ CLOSE ]' : '[ READ ]'}</span>
+                <span className="tree-action" style={{ color: 'var(--text-dim)' }}>{expandedFeed === idx ? '[ CLOSE ]' : '[ READ ]'}</span>
               </div>
               {expandedFeed === idx && (
-                <div className="feed-content" style={{ borderColor: isHacked ? '#f00' : '' }}>
-                  <pre style={{ fontFamily: 'inherit', whiteSpace: 'pre-wrap', color: item.title.includes('SECRET') ? '#f00' : 'inherit' }}>{item.content}</pre>
+                <div className="feed-content">
+                  <pre style={{ fontFamily: 'inherit', whiteSpace: 'pre-wrap' }}>{item.content}</pre>
                 </div>
               )}
             </div>
@@ -760,10 +614,6 @@ function App() {
           setHistory={setHistory}
           commandHistory={commandHistory}
           setCommandHistory={setCommandHistory}
-          isRoot={isRoot}
-          setIsRoot={setIsRoot}
-          setIsHacked={setIsHacked}
-          setIsNuking={setIsNuking}
           audioRef={audioRef}
           isPlaying={isPlaying}
           setIsPlaying={setIsPlaying}
