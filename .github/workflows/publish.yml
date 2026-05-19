@@ -27,9 +27,18 @@ jobs:
 
       - run: npm test
 
+      - name: Check npm trusted publishing setup
+        run: |
+          echo "Using npm trusted publishing through GitHub OIDC."
+          echo "npm version: $(npm --version)"
+          echo "Make sure npm trusted publishing is configured for this repository and workflow file."
+
       - name: Bump beta version
         run: |
-          LATEST=$(npm view servusai@beta version 2>/dev/null || echo "0.0.0-beta.0")
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          CURRENT=$(node -p "require('./package.json').version")
+          LATEST=$(npm view "$PACKAGE_NAME@beta" version 2>/dev/null || echo "$CURRENT")
+          echo "Package: $PACKAGE_NAME"
           echo "Latest beta on npm: $LATEST"
           npm version "$LATEST" --no-git-tag-version --allow-same-version
           npm version prerelease --preid=beta --no-git-tag-version
@@ -40,7 +49,7 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
 
-      - run: npm publish --access public --tag beta
+      - run: npm publish --access public --tag beta --provenance
 
       - name: Create and push git tag
         run: |
