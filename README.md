@@ -88,7 +88,7 @@ Useful options:
 
 ```text
 --domain <domain>          auto | coding | browser | desktop | media | data | extension | security | general
---mode <mode>              claude-code | custom
+--mode <mode>              custom
 --model <model>            Model name or provider:model
 --cwd <path>               Working directory
 --verify <command>         Custom verification command
@@ -151,7 +151,7 @@ The current stable direction is:
 - Runtime contracts and proof-backed completion as the source of truth.
 - Native Playwright for browser automation.
 - Local desktop/media/data/security capabilities.
-- Skills and plugin scaffolding now, deeper plugin/MCP activation over time.
+- Skills, plugins, hooks, project memory, and MCP server management are part of the local runtime.
 
 ## Disclaimer
 
